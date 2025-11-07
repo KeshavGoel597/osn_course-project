@@ -248,6 +248,7 @@ int send_file_to_backup(const char *filename) {
 
 // Receive file content from primary server
 int receive_file_from_primary(const char *filename, const char *owner) {
+    (void)owner; // Suppress unused parameter warning
     char filepath[MAX_PATH];
     snprintf(filepath, MAX_PATH, "%s/files/%s", server_config.storage_dir, filename);
     

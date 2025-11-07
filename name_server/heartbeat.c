@@ -6,6 +6,7 @@
 #include <time.h>
 
 void* heartbeat_monitor(void* arg) {
+    (void)arg;  // Suppress unused parameter warning
     printf("[Heartbeat Monitor] Started\n");
     
     while (nm_state->running) {

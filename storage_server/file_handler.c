@@ -228,6 +228,7 @@ static void update_file_stats(const char *filename) {
 // Write to file at specific sentence and word index
 int write_to_file(const char *filename, int sentence_index, int word_index, 
                   const char *content, const char *username) {
+    (void)username; // Suppress unused parameter warning
     FileMetadata *meta = find_metadata(filename);
     if (meta == NULL) {
         return ERR_FILE_NOT_FOUND;

@@ -125,6 +125,7 @@ int start_server() {
 
 // Handle Name Server connections
 void* handle_nm_connections(void *arg) {
+    (void)arg; // Suppress unused parameter warning
     while (1) {
         char client_ip[MAX_IP_LEN];
         int nm_conn = accept_connection(server_config.nm_sockfd, client_ip);
@@ -156,6 +157,7 @@ void* handle_nm_connections(void *arg) {
 
 // Handle Client connections
 void* handle_client_connections(void *arg) {
+    (void)arg; // Suppress unused parameter warning
     while (1) {
         char client_ip[MAX_IP_LEN];
         int client_conn = accept_connection(server_config.client_sockfd, client_ip);

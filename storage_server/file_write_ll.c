@@ -215,6 +215,7 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     // Insert first group into current sentence at word_index
     WordNode *prev_word = NULL;
     WordNode *insert_point = get_word_at_index(target_sent, word_index, &prev_word);
+    (void)insert_point; // Suppress unused variable warning
     
     // Insert words from first group
     WordNode *last_inserted = prev_word;

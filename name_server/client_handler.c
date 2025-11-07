@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 int register_client(Message *msg) {
     pthread_mutex_lock(&nm_state->client_list_mutex);

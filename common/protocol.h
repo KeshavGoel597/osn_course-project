@@ -6,7 +6,7 @@
 #define MAX_USERNAME 64
 #define MAX_DATA_SIZE 4096
 #define MAX_IP_LEN 16
-#define MAX_PATH 512
+#define MAX_PATH 1024       // Increased from 512 to avoid truncation warnings
 
 // Name Server connection details (hardcoded as per requirements)
 #define NM_IP "127.0.0.1"
