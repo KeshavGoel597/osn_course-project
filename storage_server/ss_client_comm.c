@@ -168,7 +168,7 @@ int handle_write_request(int client_sockfd, Message *msg) {
     // Receive write commands until ETIRW
     while (1) {
         Message write_cmd;
-        if (receive_message(client_sockfd, &write_cmd) < 0) {
+        if (receive_message(client_sockfd, &write_cmd) <= 0) {
             fprintf(stderr, "[WRITE] Failed to receive write command\n");
             unlock_sentence_ll(msg->filename, msg->sentence_index, msg->username);
             return -1;

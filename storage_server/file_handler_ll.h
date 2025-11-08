@@ -95,6 +95,10 @@ int has_read_access_ll(const char *filename, const char *username);
 // Check if user has write access
 int has_write_access_ll(const char *filename, const char *username);
 
+// Helper functions for path management (used by file_write_ll.c)
+void get_file_path(const char *filename, char *path, size_t size);
+void get_undo_path(const char *filename, char *path, size_t size);
+
 // Add access to user
 int add_user_access_ll(const char *filename, const char *username, int access_type);
 

@@ -95,54 +95,37 @@ static int split_content_into_groups(const char *content, WordGroup *groups, int
         
         if (word_idx == 0) continue;
         
-        // Check if word contains delimiter
-        char found_delimiter = '\0';
-        int delimiter_pos = -1;
+        // Process word character by character to handle multiple delimiters
+        // Each delimiter creates a new sentence, even in "e.g." -> "e." and "g."
+        int start_pos = 0;
         for (int i = 0; i < word_idx; i++) {
             if (is_delimiter(word_buffer[i])) {
-                found_delimiter = word_buffer[i];
-                delimiter_pos = i;
-                break;
-            }
-        }
-        
-        if (found_delimiter != '\0' && delimiter_pos < word_idx - 1) {
-            // Delimiter in middle of word - need to split
-            // e.g., "AAD.Oh" -> "AAD." and "Oh"
-            
-            // First part (up to and including delimiter)
-            char first_part[256];
-            strncpy(first_part, word_buffer, delimiter_pos + 1);
-            first_part[delimiter_pos + 1] = '\0';
-            strcpy(groups[group_count].words[groups[group_count].word_count], first_part);
-            groups[group_count].word_count++;
-            groups[group_count].delimiter = found_delimiter;
-            
-            // Start new group
-            group_count++;
-            if (group_count >= max_groups) break;
-            groups[group_count].word_count = 0;
-            groups[group_count].delimiter = '\0';
-            
-            // Second part (after delimiter)
-            char second_part[256];
-            strcpy(second_part, word_buffer + delimiter_pos + 1);
-            strcpy(groups[group_count].words[groups[group_count].word_count], second_part);
-            groups[group_count].word_count++;
-            
-        } else {
-            // Normal word or delimiter at end
-            strcpy(groups[group_count].words[groups[group_count].word_count], word_buffer);
-            groups[group_count].word_count++;
-            
-            if (found_delimiter != '\0') {
-                // Delimiter at end - end this group
-                groups[group_count].delimiter = found_delimiter;
+                // Found delimiter - add text up to and including delimiter
+                int len = i - start_pos + 1;
+                char part[256];
+                strncpy(part, word_buffer + start_pos, len);
+                part[len] = '\0';
+                
+                strcpy(groups[group_count].words[groups[group_count].word_count], part);
+                groups[group_count].word_count++;
+                groups[group_count].delimiter = word_buffer[i];
+                
+                // Start new group for next sentence
                 group_count++;
                 if (group_count >= max_groups) break;
                 groups[group_count].word_count = 0;
                 groups[group_count].delimiter = '\0';
+                
+                start_pos = i + 1;
             }
+        }
+        
+        // Add any remaining part after last delimiter (or whole word if no delimiter)
+        if (start_pos < word_idx && group_count < max_groups) {
+            char remaining[256];
+            strcpy(remaining, word_buffer + start_pos);
+            strcpy(groups[group_count].words[groups[group_count].word_count], remaining);
+            groups[group_count].word_count++;
         }
     }
     
@@ -314,12 +297,17 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     return 0;
 }
 
+// Forward declarations for helper functions
+extern void get_file_path(const char *filename, char *path, size_t size);
+extern void get_undo_path(const char *filename, char *path, size_t size);
+extern int unload_file_from_memory(const char *filename);
+
 // Undo implementation
 int undo_file_change_ll(const char *filename) {
     char filepath[MAX_PATH];
     char undo_path[MAX_PATH];
-    snprintf(filepath, MAX_PATH, "%s/files/%s", ".", filename);
-    snprintf(undo_path, MAX_PATH, "%s/undo/%s.undo", ".", filename);
+    get_file_path(filename, filepath, MAX_PATH);
+    get_undo_path(filename, undo_path, MAX_PATH);
     
     // Check if undo backup exists
     FILE *undo_fp = fopen(undo_path, "r");
@@ -329,39 +317,30 @@ int undo_file_change_ll(const char *filename) {
     }
     fclose(undo_fp);
     
-    // Unload current version from memory
-    LoadedFile *file = get_file_from_cache(filename);
-    if (file != NULL) {
-        pthread_rwlock_wrlock(&file->file_rwlock);
-        
-        // Replace file content with undo version
-        FILE *src = fopen(undo_path, "r");
-        FILE *dst = fopen(filepath, "w");
-        
-        if (src == NULL || dst == NULL) {
-            if (src) fclose(src);
-            if (dst) fclose(dst);
-            pthread_rwlock_unlock(&file->file_rwlock);
-            return -1;
-        }
-        
-        char buffer[4096];
-        size_t bytes;
-        while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
-            fwrite(buffer, 1, bytes, dst);
-        }
-        
-        fclose(src);
-        fclose(dst);
-        
-        pthread_rwlock_unlock(&file->file_rwlock);
-        
-        // Reload file into memory
-        // For now, just unload and it will reload on next access
-        // TODO: Implement proper reload
+    // Replace current file with undo version
+    FILE *src = fopen(undo_path, "r");
+    FILE *dst = fopen(filepath, "w");
+    
+    if (src == NULL || dst == NULL) {
+        if (src) fclose(src);
+        if (dst) fclose(dst);
+        fprintf(stderr, "Failed to restore undo backup for '%s'\n", filename);
+        return -1;
     }
     
-    printf("Undo completed for '%s'\n", filename);
+    char buffer[4096];
+    size_t bytes;
+    while ((bytes = fread(buffer, 1, sizeof(buffer), src)) > 0) {
+        fwrite(buffer, 1, bytes, dst);
+    }
+    
+    fclose(src);
+    fclose(dst);
+    
+    // Unload file from memory cache to force reload on next access
+    unload_file_from_memory(filename);
+    
+    printf("Undo completed for '%s', restored to previous version\n", filename);
     return 0;
 }
 

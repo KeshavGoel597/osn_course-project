@@ -95,6 +95,9 @@ void handle_get_ss_info(int socket, Message *msg) {
         return;
     }
     
+    printf("[File Location] File found: primary_ss_id=%d, backup_ss_id=%d, owner=%s\n",
+           file->primary_ss_id, file->backup_ss_id, file->owner);
+    
     // Find the appropriate server (primary or acting backup)
     int target_ss_id = file->primary_ss_id;
     int ss_index = find_storage_server(target_ss_id);
@@ -102,10 +105,12 @@ void handle_get_ss_info(int socket, Message *msg) {
     if (ss_index < 0) {
         response.error_code = ERR_SERVER_ERROR;
         strcpy(response.data, "Storage server not found");
-        printf("[File Location] Primary server SS%d not found\n", target_ss_id);
+        printf("[File Location] Primary server SS%d not found (ss_index=%d)\n", target_ss_id, ss_index);
         send_message(socket, &response);
         return;
     }
+    
+    printf("[File Location] Found storage server at index %d\n", ss_index);
     
     StorageServerInfo *ss = &nm_state->storage_servers[ss_index];
     
@@ -162,6 +167,8 @@ void handle_get_ss_info(int socket, Message *msg) {
         response.port1 = ss->client_port;
         response.error_code = ERR_SUCCESS;
         
+        printf("[File Location] Primary server online. IP=%s, client_port=%d\n", 
+               ss->ip, ss->client_port);
         printf("[File Location] File '%s' located on primary server SS%d at %s:%d\n", 
                msg->filename, target_ss_id, ss->ip, ss->client_port);
         
@@ -172,6 +179,8 @@ void handle_get_ss_info(int socket, Message *msg) {
         response.ss_id = target_ss_id;
         snprintf(response.data, sizeof(response.data), 
                 "File located on SS%d at %s:%d", target_ss_id, response.ip, response.port1);
+        printf("[File Location] Sending response: ip=%s, port=%d, ss_id=%d\n",
+               response.ip, response.port1, response.ss_id);
     }
     
     send_message(socket, &response);
@@ -369,30 +378,27 @@ void handle_delete_file(int socket, Message *msg) {
 }
 
 void handle_list_files(int socket, Message *msg) {
-    printf("[File List] Client '%s' requesting file list\n", msg->username);
+    printf("[File List] Client '%s' requesting user list\n", msg->username);
     
     Message response = {0};
     response.msg_type = MSG_RESPONSE;
     response.operation = OP_LIST;
     response.error_code = ERR_SUCCESS;
     
-    char file_list[MAX_DATA_SIZE] = {0};
+    char user_list[MAX_DATA_SIZE] = {0};
     int pos = 0;
     
-    pthread_mutex_lock(&nm_state->ss_list_mutex);
+    pthread_mutex_lock(&nm_state->client_list_mutex);
     
-    for (int i = 0; i < nm_state->ss_count; i++) {
-        StorageServerInfo *ss = &nm_state->storage_servers[i];
-        
-        pthread_mutex_lock(&ss->ss_mutex);
-        for (int j = 0; j < ss->file_count; j++) {
-            FileInfo *file = &ss->files[j];
+    if (nm_state->client_count == 0) {
+        strcpy(response.data, "No users found");
+    } else {
+        // List each user on a new line
+        for (int i = 0; i < nm_state->client_count; i++) {
+            ClientInfo *client = &nm_state->clients[i];
             
-            // Format: filename,owner,primary_ss,backup_ss;
-            int written = snprintf(file_list + pos, MAX_DATA_SIZE - pos, 
-                                  "%s,%s,SS%d,SS%d;", 
-                                  file->filename, file->owner, 
-                                  file->primary_ss_id, file->backup_ss_id);
+            int written = snprintf(user_list + pos, MAX_DATA_SIZE - pos, 
+                                  "%s\n", client->username);
             
             if (written > 0 && pos + written < MAX_DATA_SIZE) {
                 pos += written;
@@ -400,18 +406,13 @@ void handle_list_files(int socket, Message *msg) {
                 break;  // Buffer full
             }
         }
-        pthread_mutex_unlock(&ss->ss_mutex);
+        strcpy(response.data, user_list);
     }
     
-    pthread_mutex_unlock(&nm_state->ss_list_mutex);
+    pthread_mutex_unlock(&nm_state->client_list_mutex);
     
-    if (pos == 0) {
-        strcpy(response.data, "No files found");
-    } else {
-        strcpy(response.data, file_list);
-    }
-    
-    printf("[File List] Sent file list to client '%s' (%d bytes)\n", msg->username, pos);
+    printf("[File List] Sent user list to client '%s' (%d users)\n", 
+           msg->username, nm_state->client_count);
     send_message(socket, &response);
 }
 
@@ -564,7 +565,31 @@ static int user_has_access(const char *filename, const char *username, int ss_id
         info_response.error_code == ERR_NO_READ_ACCESS) {
         return 1;
     }
+    char owner_search[MAX_USERNAME + 10];
+    snprintf(owner_search, sizeof(owner_search), "Owner: %s", username);
+    if (strstr(info_response.data, owner_search) != NULL) {
+        return 1; // User is the owner
+    }
+
+    // 2. Check if the user is in the access list
+    char *access_line = strstr(info_response.data, "Access: ");
+    if (access_line == NULL) {
+        return 0; // No access line found, default to no access
+    }
+
+    // Create search strings for Read or Read/Write access
+    char access_r[MAX_USERNAME + 5];
+    char access_rw[MAX_USERNAME + 5];
+    snprintf(access_r, sizeof(access_r), "%s(R)", username);
+    snprintf(access_rw, sizeof(access_rw), "%s(RW)", username);
+
+    if (strstr(access_line, access_r) != NULL || strstr(access_line, access_rw) != NULL) {
+        return 1; // User found in access list
+    }
     
+    // *** END OF FIX ***
+
+    // User is not the owner and not in the access list
     return 0;
 }
 
@@ -641,14 +666,24 @@ void handle_view_files(int socket, Message *msg) {
         for (int j = 0; j < ss->file_count; j++) {
             FileInfo *file = &ss->files[j];
             
-            // Check access permission if not showing all files
+            // Access control logic:
+            // - Without -a flag: show files user has access to (owned OR granted access)
+            // - With -a flag: show ALL files in the system (no filtering)
+            
+            int is_owner = (strcmp(file->owner, msg->username) == 0);
+            int has_access = 0;
+            
+            if (!is_owner) {
+                // Check if user has access to this file
+                has_access = user_has_access(file->filename, msg->username, file->primary_ss_id);
+            }
+            
+            // With -a flag: show all files (no filtering)
+            // Without -a flag: only show files user owns or has been granted access to
             if (!show_all) {
-                // Check if user is owner
-                if (strcmp(file->owner, msg->username) != 0) {
-                    // Not owner, need to check access list
-                    if (!user_has_access(file->filename, msg->username, file->primary_ss_id)) {
-                        continue;  // Skip this file
-                    }
+                // User must be owner OR have access to see the file
+                if (!is_owner && !has_access) {
+                    continue;  // Skip files user has no access to
                 }
             }
             

@@ -33,12 +33,12 @@ static void get_timestamp(char *buffer, size_t size) {
 }
 
 // Helper function to get file path
-static void get_file_path(const char *filename, char *path, size_t size) {
+void get_file_path(const char *filename, char *path, size_t size) {
     snprintf(path, size, "%s/%s", files_dir, filename);
 }
 
 // Helper function to get undo file path
-static void get_undo_path(const char *filename, char *path, size_t size) {
+void get_undo_path(const char *filename, char *path, size_t size) {
     snprintf(path, size, "%s/%s.undo", undo_dir, filename);
 }
 
@@ -159,39 +159,62 @@ static SentenceNode* parse_file_to_linked_list(const char *content) {
         
         if (word_idx == 0) continue;
         
-        // Check if word contains delimiter
-        char delimiter = '\0';
-        for (int i = word_idx - 1; i >= 0; i--) {
+        // Process word character by character to handle multiple delimiters
+        // Each delimiter creates a new sentence, even in "e.g." -> "e." and "g."
+        int start_pos = 0;
+        for (int i = 0; i < word_idx; i++) {
             if (is_delimiter(word_buffer[i])) {
-                delimiter = word_buffer[i];
-                break;
+                // Found delimiter - create word up to and including delimiter
+                char part[256];
+                int len = i - start_pos + 1;
+                strncpy(part, word_buffer + start_pos, len);
+                part[len] = '\0';
+                
+                WordNode *new_word = create_word_node(part);
+                if (new_word == NULL) {
+                    free_sentence_list(sentences_head);
+                    return NULL;
+                }
+                
+                if (current_sentence->words_head == NULL) {
+                    current_sentence->words_head = new_word;
+                    current_word = new_word;
+                } else {
+                    current_word->next = new_word;
+                    current_word = new_word;
+                }
+                
+                // End this sentence
+                current_sentence->delimiter = word_buffer[i];
+                
+                // Create new sentence for next part
+                SentenceNode *new_sentence = create_sentence_node('\0');
+                current_sentence->next = new_sentence;
+                current_sentence = new_sentence;
+                current_word = NULL;
+                
+                start_pos = i + 1;
             }
         }
         
-        // Add word to current sentence
-        WordNode *new_word = create_word_node(word_buffer);
-        if (new_word == NULL) {
-            free_sentence_list(sentences_head);
-            return NULL;
-        }
-        
-        if (current_sentence->words_head == NULL) {
-            current_sentence->words_head = new_word;
-            current_word = new_word;
-        } else {
-            current_word->next = new_word;
-            current_word = new_word;
-        }
-        
-        // If we found a delimiter, end this sentence
-        if (delimiter != '\0') {
-            current_sentence->delimiter = delimiter;
+        // Add any remaining part after last delimiter
+        if (start_pos < word_idx) {
+            char remaining[256];
+            strcpy(remaining, word_buffer + start_pos);
             
-            // Create new sentence for next iteration
-            SentenceNode *new_sentence = create_sentence_node('\0');
-            current_sentence->next = new_sentence;
-            current_sentence = new_sentence;
-            current_word = NULL;
+            WordNode *new_word = create_word_node(remaining);
+            if (new_word == NULL) {
+                free_sentence_list(sentences_head);
+                return NULL;
+            }
+            
+            if (current_sentence->words_head == NULL) {
+                current_sentence->words_head = new_word;
+                current_word = new_word;
+            } else {
+                current_word->next = new_word;
+                current_word = new_word;
+            }
         }
     }
     
@@ -578,10 +601,25 @@ int lock_sentence_ll(const char *filename, int sentence_index, const char *usern
                    sentence_index, filename, username);
             return 0;
         }
-        // Locked by different user
-        printf("Sentence %d in '%s' locked by '%s', requested by '%s'\n", 
+        // Locked by different user - try to clean up stale locks
+        printf("Sentence %d in '%s' appears locked by '%s', requested by '%s'\n", 
                sentence_index, filename, sent->locked_by, username);
-        return ERR_SENTENCE_LOCKED;
+        
+        // Try to acquire the mutex to check if it's truly locked
+        int trylock_result = pthread_mutex_trylock(&sent->sentence_lock);
+        if (trylock_result == 0) {
+            // We got the lock! Previous lock was stale (client disconnected)
+            printf("[Lock Cleanup] Stale lock detected, cleaning up and granting to '%s'\n", username);
+            sent->is_locked = 1;
+            strncpy(sent->locked_by, username, MAX_USERNAME - 1);
+            sent->locked_by[MAX_USERNAME - 1] = '\0';
+            printf("Sentence %d in '%s' locked by '%s' (after cleanup)\n", sentence_index, filename, username);
+            return 0;
+        } else {
+            // Truly locked by another active connection
+            printf("[Lock] Sentence is actively locked, access denied\n");
+            return ERR_SENTENCE_LOCKED;
+        }
     }
     
     // Try to lock (non-blocking)
@@ -619,9 +657,16 @@ int unlock_sentence_ll(const char *filename, int sentence_index, const char *use
         return -1;
     }
     
-    // Check if locked by this user
-    if (!sent->is_locked || strcmp(sent->locked_by, username) != 0) {
-        return -1;
+    // Check if locked by this user (or if it's a stale lock, allow cleanup)
+    if (!sent->is_locked) {
+        printf("Sentence %d in '%s' was not locked\n", sentence_index, filename);
+        return 0;  // Already unlocked, return success
+    }
+    
+    if (strcmp(sent->locked_by, username) != 0) {
+        printf("Warning: Sentence %d in '%s' locked by '%s' but unlock requested by '%s'\n",
+               sentence_index, filename, sent->locked_by, username);
+        // Allow unlock anyway for cleanup purposes
     }
     
     // Release lock
