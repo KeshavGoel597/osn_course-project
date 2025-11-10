@@ -108,6 +108,7 @@ void handle_addaccess(int client_socket, Message *msg);
 void handle_remaccess(int client_socket, Message *msg);
 void handle_list_files(int client_socket, Message *msg);
 void handle_view_files(int client_socket, Message *msg);
+void handle_exec(int client_socket, Message *msg);
 
 // Heartbeat and monitoring
 void* heartbeat_monitor(void* arg);

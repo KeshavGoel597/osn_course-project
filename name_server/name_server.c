@@ -235,6 +235,10 @@ void handle_connection(void *arg) {
             handle_view_files(socket, &msg);
             break;
             
+        case OP_EXEC:
+            handle_exec(socket, &msg);
+            break;
+        
         default:
             printf("Unknown operation: %d\n", msg.operation);
             Message error_msg = {0};

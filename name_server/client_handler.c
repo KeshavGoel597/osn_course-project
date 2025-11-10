@@ -794,3 +794,190 @@ buffer_full:
     printf("[File View] Sent file view to client '%s' (%d bytes)\n", msg->username, pos);
     send_message(socket, &response);
 }
+
+// Execute file contents as shell commands on Name Server
+void handle_exec(int socket, Message *msg) {
+    printf("[File Exec] Client '%s' requesting execution of file '%s'\n", 
+           msg->username, msg->filename);
+    
+    Message response = {0};
+    response.msg_type = MSG_RESPONSE;
+    response.operation = OP_EXEC;
+    response.error_code = ERR_SUCCESS;
+    
+    // 1. Find the file in the system
+    FileInfo *file = find_file(msg->filename);
+    
+    if (!file) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_FILE_NOT_FOUND;
+        snprintf(response.data, MAX_DATA_SIZE, "File '%s' not found", msg->filename);
+        printf("[File Exec] File '%s' not found\n", msg->filename);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // 2. Check access permissions (user must have read access or be owner)
+    int is_owner = (strcmp(file->owner, msg->username) == 0);
+    int has_access = 0;
+    
+    if (!is_owner) {
+        // Check if user has access to this file
+        has_access = user_has_access(msg->filename, msg->username, file->primary_ss_id);
+    }
+    
+    if (!is_owner && !has_access) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_NO_READ_ACCESS;
+        snprintf(response.data, MAX_DATA_SIZE, "No read access to file '%s'", msg->filename);
+        printf("[File Exec] User '%s' has no read access to file '%s'\n", 
+               msg->username, msg->filename);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // 3. Request file content from Storage Server
+    int ss_index = find_storage_server(file->primary_ss_id);
+    if (ss_index < 0) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Storage server not available");
+        printf("[File Exec] Storage server SS%d not found\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    StorageServerInfo *ss = &nm_state->storage_servers[ss_index];
+    
+    // Connect to storage server
+    int ss_socket = connect_to_server(ss->ip, ss->nm_port);
+    if (ss_socket < 0) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "Failed to connect to storage server");
+        printf("[File Exec] Failed to connect to SS%d at %s:%d\n", 
+               file->primary_ss_id, ss->ip, ss->nm_port);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Send EXEC request to SS to get file content
+    Message exec_msg = {0};
+    exec_msg.msg_type = MSG_REQUEST;
+    exec_msg.operation = OP_EXEC;
+    strcpy(exec_msg.filename, msg->filename);
+    strcpy(exec_msg.username, msg->username);
+    
+    if (send_message(ss_socket, &exec_msg) < 0) {
+        close(ss_socket);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to request file content");
+        printf("[File Exec] Failed to send EXEC request to SS%d\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Receive file content from SS
+    Message ss_response = {0};
+    if (receive_message(ss_socket, &ss_response) < 0) {
+        close(ss_socket);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to receive file content");
+        printf("[File Exec] Failed to receive response from SS%d\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    close(ss_socket);
+    
+    // Check if SS returned an error
+    if (ss_response.error_code != ERR_SUCCESS) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ss_response.error_code;
+        strcpy(response.data, ss_response.data);
+        printf("[File Exec] SS%d returned error: %d\n", file->primary_ss_id, ss_response.error_code);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // 4. Execute the file content as shell commands on Name Server
+    printf("[File Exec] Executing commands from file '%s'\n", msg->filename);
+    printf("[File Exec] File content:\n%s\n", ss_response.data);
+    
+    // Create a temporary file to hold the commands
+    char temp_file[256];
+    snprintf(temp_file, sizeof(temp_file), "/tmp/nm_exec_%s_%ld.sh", 
+             msg->username, (long)time(NULL));
+    
+    FILE *fp = fopen(temp_file, "w");
+    if (!fp) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to create temporary execution file");
+        printf("[File Exec] Failed to create temp file: %s\n", temp_file);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Write the commands to temp file
+    fprintf(fp, "%s", ss_response.data);
+    fclose(fp);
+    
+    // Execute the commands and capture output
+    char exec_cmd[512];
+    snprintf(exec_cmd, sizeof(exec_cmd), "bash %s 2>&1", temp_file);
+    
+    FILE *pipe = popen(exec_cmd, "r");
+    if (!pipe) {
+        unlink(temp_file);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to execute commands");
+        printf("[File Exec] Failed to execute: %s\n", exec_cmd);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Read output from command execution
+    char output[MAX_DATA_SIZE] = {0};
+    size_t output_len = 0;
+    char buffer[256];
+    
+    while (fgets(buffer, sizeof(buffer), pipe) != NULL && output_len < MAX_DATA_SIZE - 1) {
+        size_t len = strlen(buffer);
+        if (output_len + len < MAX_DATA_SIZE - 1) {
+            strcpy(output + output_len, buffer);
+            output_len += len;
+        } else {
+            // Buffer full, truncate
+            break;
+        }
+    }
+    
+    int exec_status = pclose(pipe);
+    unlink(temp_file);  // Clean up temp file
+    
+    // 5. Send execution output back to client
+    if (output_len == 0) {
+        if (exec_status == 0) {
+            strcpy(response.data, "[No output - command executed successfully]");
+        } else {
+            snprintf(response.data, MAX_DATA_SIZE, 
+                    "[Command execution failed with status %d]", exec_status);
+            response.error_code = ERR_SERVER_ERROR;
+        }
+    } else {
+        strncpy(response.data, output, MAX_DATA_SIZE - 1);
+        response.data[MAX_DATA_SIZE - 1] = '\0';
+    }
+    
+    printf("[File Exec] Execution complete. Output length: %zu bytes, Status: %d\n", 
+           output_len, exec_status);
+    printf("[File Exec] Sending result to client '%s'\n", msg->username);
+    
+    send_message(socket, &response);
+    
+    log_operation("FILE_EXEC", msg->filename);
+}
