@@ -89,6 +89,12 @@ int get_file_metadata_ll(const char *filename, FileMetadata *metadata);
 // Update file metadata
 int update_file_metadata_ll(const char *filename, FileMetadata *metadata);
 
+// Update file modified timestamp
+int update_file_modified_time_ll(const char *filename);
+
+// Update file accessed timestamp
+int update_file_accessed_time_ll(const char *filename, const char *username);
+
 // Check if user has read access
 int has_read_access_ll(const char *filename, const char *username);
 

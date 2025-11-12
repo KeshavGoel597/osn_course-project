@@ -5,6 +5,106 @@
 #include <string.h>
 #include <time.h>
 
+// ============================================================================
+// HASH TABLE IMPLEMENTATION FOR EFFICIENT FILE SEARCH (O(1))
+// ============================================================================
+
+// Initialize hash table
+void init_file_hash_table() {
+    memset(&nm_state->file_index.buckets, 0, sizeof(nm_state->file_index.buckets));
+    pthread_mutex_init(&nm_state->file_index.hash_mutex, NULL);
+    printf("[Hash Table] Initialized with %d buckets\n", FILE_HASH_TABLE_SIZE);
+}
+
+// Hash function using djb2 algorithm (Dan Bernstein)
+unsigned int hash_filename(const char *filename) {
+    unsigned long hash = 5381;
+    int c;
+    
+    while ((c = *filename++)) {
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    }
+    
+    return hash % FILE_HASH_TABLE_SIZE;
+}
+
+// Insert file into hash table
+void hash_insert_file(FileInfo *file) {
+    pthread_mutex_lock(&nm_state->file_index.hash_mutex);
+    
+    unsigned int index = hash_filename(file->filename);
+    
+    // Create new node
+    FileHashNode *node = (FileHashNode *)malloc(sizeof(FileHashNode));
+    if (node == NULL) {
+        fprintf(stderr, "[Hash Table] Failed to allocate memory for hash node\n");
+        pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+        return;
+    }
+    
+    strncpy(node->filename, file->filename, MAX_FILENAME - 1);
+    node->filename[MAX_FILENAME - 1] = '\0';
+    node->file_ptr = file;
+    node->next = nm_state->file_index.buckets[index];
+    
+    nm_state->file_index.buckets[index] = node;
+    
+    pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+    
+    printf("[Hash Table] Inserted file '%s' at bucket %u\n", file->filename, index);
+}
+
+// Remove file from hash table
+void hash_remove_file(const char *filename) {
+    pthread_mutex_lock(&nm_state->file_index.hash_mutex);
+    
+    unsigned int index = hash_filename(filename);
+    FileHashNode *current = nm_state->file_index.buckets[index];
+    FileHashNode *prev = NULL;
+    
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            if (prev == NULL) {
+                nm_state->file_index.buckets[index] = current->next;
+            } else {
+                prev->next = current->next;
+            }
+            free(current);
+            printf("[Hash Table] Removed file '%s' from bucket %u\n", filename, index);
+            pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+            return;
+        }
+        prev = current;
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+}
+
+// Find file in hash table - O(1) average case
+FileInfo* hash_find_file(const char *filename) {
+    pthread_mutex_lock(&nm_state->file_index.hash_mutex);
+    
+    unsigned int index = hash_filename(filename);
+    FileHashNode *current = nm_state->file_index.buckets[index];
+    
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            FileInfo *file = current->file_ptr;
+            pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+            return file;
+        }
+        current = current->next;
+    }
+    
+    pthread_mutex_unlock(&nm_state->file_index.hash_mutex);
+    return NULL;
+}
+
+// ============================================================================
+// STORAGE SERVER MANAGEMENT
+// ============================================================================
+
 int register_storage_server(Message *msg) {
     pthread_mutex_lock(&nm_state->ss_list_mutex);
     
@@ -16,15 +116,42 @@ int register_storage_server(Message *msg) {
         StorageServerInfo *ss = &nm_state->storage_servers[existing_index];
         
         pthread_mutex_lock(&ss->ss_mutex);
+        int was_offline = (ss->status == SS_STATUS_OFFLINE);
         strcpy(ss->ip, msg->ip);
         ss->nm_port = msg->port1;
         ss->client_port = msg->port2;
         ss->status = SS_STATUS_ONLINE;
         ss->last_heartbeat = time(NULL);
+        int is_primary_server = ss->is_primary;
+        int backup_id = ss->backup_ss_id;
         pthread_mutex_unlock(&ss->ss_mutex);
         
         printf("[SS Registration] Storage Server %d reconnected\n", msg->ss_id);
         log_operation("SS_RECONNECT", msg->data);
+        
+        // If this was a failed primary server recovering, and it has a backup,
+        // the backup may have been serving requests - need to re-sync
+        if (was_offline && is_primary_server && backup_id > 0) {
+            int backup_index = find_storage_server(backup_id);
+            if (backup_index >= 0) {
+                StorageServerInfo *backup = &nm_state->storage_servers[backup_index];
+                pthread_mutex_lock(&backup->ss_mutex);
+                
+                if (backup->status == SS_STATUS_ACTING_PRIMARY) {
+                    // Backup was acting as primary - demote it and tell primary to re-sync
+                    backup->status = SS_STATUS_ONLINE;
+                    printf("[SS Recovery] SS%d recovered, demoting backup SS%d from acting primary\n",
+                           msg->ss_id, backup_id);
+                    pthread_mutex_unlock(&backup->ss_mutex);
+                    
+                    // TODO: Send message to recovered primary to request full sync from backup
+                    // For now, just log it - the primary should request sync from backup during reconnection
+                    log_operation("SS_RECOVERY", "Primary server recovered, needs re-sync from backup");
+                } else {
+                    pthread_mutex_unlock(&backup->ss_mutex);
+                }
+            }
+        }
     } else {
         // New server registration
         if (nm_state->ss_count >= MAX_STORAGE_SERVERS) {
@@ -74,6 +201,10 @@ int register_storage_server(Message *msg) {
                 ss->files[ss->file_count].backup_ss_id = 0;  // Will be set during pairing
                 ss->files[ss->file_count].created_time = time(NULL);
                 ss->files[ss->file_count].modified_time = time(NULL);
+                
+                // Add file to hash table for O(1) lookup
+                hash_insert_file(&ss->files[ss->file_count]);
+                
                 ss->file_count++;
                 
                 printf("[SS Registration] Registered file: %s (owner: %s)\n", filename, owner);
@@ -255,6 +386,9 @@ int add_file_to_server(int ss_id, const char *filename, const char *owner) {
     file->created_time = time(NULL);
     file->modified_time = time(NULL);
     
+    // Add to hash table for O(1) lookup
+    hash_insert_file(file);
+    
     ss->file_count++;
     
     pthread_mutex_unlock(&ss->ss_mutex);
@@ -276,6 +410,9 @@ int remove_file_from_server(int ss_id, const char *filename) {
     // Find and remove file
     for (int i = 0; i < ss->file_count; i++) {
         if (strcmp(ss->files[i].filename, filename) == 0) {
+            // Remove from hash table first
+            hash_remove_file(filename);
+            
             // Shift remaining files
             for (int j = i; j < ss->file_count - 1; j++) {
                 ss->files[j] = ss->files[j + 1];
@@ -293,25 +430,8 @@ int remove_file_from_server(int ss_id, const char *filename) {
 }
 
 FileInfo* find_file(const char *filename) {
-    pthread_mutex_lock(&nm_state->ss_list_mutex);
-    
-    for (int i = 0; i < nm_state->ss_count; i++) {
-        StorageServerInfo *ss = &nm_state->storage_servers[i];
-        
-        pthread_mutex_lock(&ss->ss_mutex);
-        for (int j = 0; j < ss->file_count; j++) {
-            if (strcmp(ss->files[j].filename, filename) == 0) {
-                FileInfo *file = &ss->files[j];
-                pthread_mutex_unlock(&ss->ss_mutex);
-                pthread_mutex_unlock(&nm_state->ss_list_mutex);
-                return file;
-            }
-        }
-        pthread_mutex_unlock(&ss->ss_mutex);
-    }
-    
-    pthread_mutex_unlock(&nm_state->ss_list_mutex);
-    return NULL;
+    // Use hash table for O(1) lookup instead of O(N*M) linear search
+    return hash_find_file(filename);
 }
 
 int find_primary_for_file(const char *filename) {

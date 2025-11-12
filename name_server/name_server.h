@@ -12,6 +12,7 @@
 #define MAX_CLIENTS 100
 #define HEARTBEAT_INTERVAL 10  // seconds
 #define HEARTBEAT_TIMEOUT 30   // seconds
+#define FILE_HASH_TABLE_SIZE 10007  // Prime number for better distribution
 
 // Storage Server Status
 #define SS_STATUS_ONLINE 1
@@ -52,6 +53,19 @@ typedef struct {
     int is_connected;
 } ClientInfo;
 
+// Hash Table Entry for Fast File Lookup (O(1))
+typedef struct FileHashNode {
+    char filename[MAX_FILENAME];
+    FileInfo *file_ptr;  // Pointer to the actual FileInfo in storage_servers array
+    struct FileHashNode *next;  // For collision chaining
+} FileHashNode;
+
+// Hash Table for Efficient File Search
+typedef struct {
+    FileHashNode *buckets[FILE_HASH_TABLE_SIZE];
+    pthread_mutex_t hash_mutex;  // Protects hash table operations
+} FileHashTable;
+
 // Global Name Server State
 typedef struct {
     StorageServerInfo storage_servers[MAX_STORAGE_SERVERS];
@@ -61,6 +75,8 @@ typedef struct {
     ClientInfo clients[MAX_CLIENTS];
     int client_count;
     pthread_mutex_t client_list_mutex;
+    
+    FileHashTable file_index;  // Hash table for O(1) file lookups
     
     int next_primary_ss;  // Round-robin for file assignment
     pthread_mutex_t assignment_mutex;
@@ -85,6 +101,13 @@ void setup_backup_pairing(int primary_ss_id);
 void handle_storage_server_failure(int ss_id);
 void promote_backup_to_primary(int backup_ss_id, int failed_primary_ss_id);
 
+// Hash Table Functions for Efficient File Search (O(1))
+void init_file_hash_table();
+unsigned int hash_filename(const char *filename);
+void hash_insert_file(FileInfo *file);
+void hash_remove_file(const char *filename);
+FileInfo* hash_find_file(const char *filename);
+
 // Client management
 int register_client(Message *msg);
 int find_client(const char *username);
@@ -104,6 +127,7 @@ void handle_client_registration(int socket, Message *msg);
 void handle_get_ss_info(int client_socket, Message *msg);
 void handle_create_file(int client_socket, Message *msg);
 void handle_delete_file(int client_socket, Message *msg);
+void handle_info_request(int socket, Message *msg);
 void handle_addaccess(int client_socket, Message *msg);
 void handle_remaccess(int client_socket, Message *msg);
 void handle_list_files(int client_socket, Message *msg);

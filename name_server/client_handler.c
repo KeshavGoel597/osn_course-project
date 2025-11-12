@@ -387,7 +387,7 @@ void handle_delete_file(int socket, Message *msg) {
 }
 
 void handle_list_files(int socket, Message *msg) {
-    printf("[File List] Client '%s' requesting user list\n", msg->username);
+    printf("[User List] Client '%s' requesting user list\n", msg->username);
     
     Message response = {0};
     response.msg_type = MSG_RESPONSE;
@@ -402,12 +402,12 @@ void handle_list_files(int socket, Message *msg) {
     if (nm_state->client_count == 0) {
         strcpy(response.data, "No users found");
     } else {
-        // List each user on a new line
+        // List each user on a new line (prepend with --> for formatting)
         for (int i = 0; i < nm_state->client_count; i++) {
             ClientInfo *client = &nm_state->clients[i];
             
             int written = snprintf(user_list + pos, MAX_DATA_SIZE - pos, 
-                                  "%s\n", client->username);
+                                  "--> %s\n", client->username);
             
             if (written > 0 && pos + written < MAX_DATA_SIZE) {
                 pos += written;
@@ -420,7 +420,7 @@ void handle_list_files(int socket, Message *msg) {
     
     pthread_mutex_unlock(&nm_state->client_list_mutex);
     
-    printf("[File List] Sent user list to client '%s' (%d users)\n", 
+    printf("[User List] Sent user list to client '%s' (%d users)\n", 
            msg->username, nm_state->client_count);
     send_message(socket, &response);
 }
@@ -687,6 +687,95 @@ static int get_file_details(const char *filename, int ss_id, char *details, int 
     return -1;
 }
 
+void handle_info_request(int socket, Message *msg) {
+    printf("[File Info] Client '%s' requesting info for file '%s'\n", 
+           msg->username, msg->filename);
+    
+    FileInfo *file = find_file(msg->filename);
+    
+    Message response = {0};
+    response.msg_type = MSG_RESPONSE;
+    response.operation = OP_INFO;
+    
+    if (!file) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_FILE_NOT_FOUND;
+        snprintf(response.data, MAX_DATA_SIZE, "File '%s' not found", msg->filename);
+        printf("[File Info] File '%s' not found\n", msg->filename);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Get Storage Server info
+    int ss_index = find_storage_server(file->primary_ss_id);
+    if (ss_index < 0) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Storage server not available");
+        printf("[File Info] Storage server SS%d not found\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    StorageServerInfo *ss = &nm_state->storage_servers[ss_index];
+    
+    // Connect to storage server to get detailed info
+    int ss_socket = connect_to_server(ss->ip, ss->nm_port);
+    if (ss_socket < 0) {
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_CONNECTION_FAILED;
+        strcpy(response.data, "Failed to connect to storage server");
+        printf("[File Info] Failed to connect to SS%d\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Forward INFO request to storage server
+    Message ss_msg = {0};
+    ss_msg.msg_type = MSG_REQUEST;
+    ss_msg.operation = OP_INFO;
+    strcpy(ss_msg.filename, msg->filename);
+    strcpy(ss_msg.username, msg->username);
+    
+    if (send_message(ss_socket, &ss_msg) < 0) {
+        close(ss_socket);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to request file info");
+        printf("[File Info] Failed to send INFO request to SS%d\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Receive response from storage server
+    Message ss_response = {0};
+    if (receive_message(ss_socket, &ss_response) < 0) {
+        close(ss_socket);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Failed to receive file info");
+        printf("[File Info] Failed to receive response from SS%d\n", file->primary_ss_id);
+        send_message(socket, &response);
+        return;
+    }
+    
+    close(ss_socket);
+    
+    // Forward storage server response to client
+    response.msg_type = ss_response.msg_type;
+    response.error_code = ss_response.error_code;
+    strcpy(response.data, ss_response.data);
+    
+    if (ss_response.error_code == ERR_SUCCESS) {
+        printf("[File Info] Successfully retrieved info for '%s'\n", msg->filename);
+    } else {
+        printf("[File Info] Failed to retrieve info for '%s': error %d\n", 
+               msg->filename, ss_response.error_code);
+    }
+    
+    send_message(socket, &response);
+}
+
 void handle_view_files(int socket, Message *msg) {
     printf("[File View] Client '%s' requesting file view with flags %d\n", 
            msg->username, msg->sentence_index);
@@ -706,11 +795,12 @@ void handle_view_files(int socket, Message *msg) {
     // Add header for long format
     if (show_long) {
         pos += snprintf(file_list + pos, MAX_DATA_SIZE - pos,
-                       "%-30s %-15s %-10s %-10s %-10s\n",
-                       "FILENAME", "OWNER", "WORDS", "CHARS", "SS");
+                       "---------------------------------------------------------\n");
         pos += snprintf(file_list + pos, MAX_DATA_SIZE - pos,
-                       "%-30s %-15s %-10s %-10s %-10s\n",
-                       "--------", "-----", "-----", "-----", "--");
+                       "| %-12s | %-7s | %-7s | %-16s | %-7s |\n",
+                       "Filename", "Words", "Chars", "Last Access", "Owner");
+        pos += snprintf(file_list + pos, MAX_DATA_SIZE - pos,
+                       "|--------------|---------|---------|------------------|-------|\n");
     }
     
     pthread_mutex_lock(&nm_state->ss_list_mutex);
@@ -749,27 +839,35 @@ void handle_view_files(int socket, Message *msg) {
                 // Get detailed info from storage server
                 char details[512] = {0};
                 if (get_file_details(file->filename, file->primary_ss_id, details, sizeof(details)) == 0) {
-                    // Parse details: "File: <name>\nOwner: <owner>\n...\nWords: <count>\nCharacters: <count>\n..."
+                    // Parse details: "File: <name>\nOwner: <owner>\n...\nWords: <count>\nCharacters: <count>\nLast Accessed: <time>\n..."
                     int words = 0, chars = 0;
+                    char last_access[64] = "N/A";
+                    
                     // Parse the multi-line response
                     char *words_line = strstr(details, "Words: ");
                     char *chars_line = strstr(details, "Characters: ");
+                    char *access_line = strstr(details, "Last Accessed: ");
+                    
                     if (words_line) sscanf(words_line, "Words: %d", &words);
                     if (chars_line) sscanf(chars_line, "Characters: %d", &chars);
+                    if (access_line) {
+                        // Extract timestamp (format: "Last Accessed: 2025-10-10 14:32")
+                        sscanf(access_line, "Last Accessed: %63[^\n]", last_access);
+                    }
                     
                     written = snprintf(file_list + pos, MAX_DATA_SIZE - pos,
-                                      "%-30s %-15s %-10d %-10d SS%-8d\n",
-                                      file->filename, file->owner, words, chars, file->primary_ss_id);
+                                      "| %-12s | %7d | %7d | %-16s | %-7s |\n",
+                                      file->filename, words, chars, last_access, file->owner);
                 } else {
                     // Fallback if can't get details
                     written = snprintf(file_list + pos, MAX_DATA_SIZE - pos,
-                                      "%-30s %-15s %-10s %-10s SS%-8d\n",
-                                      file->filename, file->owner, "N/A", "N/A", file->primary_ss_id);
+                                      "| %-12s | %7s | %7s | %-16s | %-7s |\n",
+                                      file->filename, "N/A", "N/A", "N/A", file->owner);
                 }
             } else {
-                // Simple format: just filename
+                // Simple format: just filename with --> prefix
                 written = snprintf(file_list + pos, MAX_DATA_SIZE - pos,
-                                  "%s\n", file->filename);
+                                  "--> %s\n", file->filename);
             }
             
             if (written > 0 && pos + written < MAX_DATA_SIZE) {
@@ -785,9 +883,14 @@ void handle_view_files(int socket, Message *msg) {
 buffer_full:
     pthread_mutex_unlock(&nm_state->ss_list_mutex);
     
-    if (pos == 0 || (show_long && pos <= 122)) {  // Only header
+    if (pos == 0 || (show_long && pos <= 200)) {  // Only header
         strcpy(response.data, "No files found");
     } else {
+        // Add closing border for long format
+        if (show_long) {
+            snprintf(file_list + pos, MAX_DATA_SIZE - pos,
+                    "---------------------------------------------------------\n");
+        }
         strcpy(response.data, file_list);
     }
     

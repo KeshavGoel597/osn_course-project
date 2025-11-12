@@ -130,11 +130,10 @@ void* handle_nm_connection(void *arg) {
             if (result < 0) {
                 response.error_code = (result == ERR_FILE_EXISTS) ? ERR_FILE_EXISTS : ERR_SERVER_ERROR;
             } else {
-                // Replicate to backup server if this is a primary server
+                // Replicate to backup server asynchronously (non-blocking)
                 if (server_config.is_primary) {
-                    if (replicate_create(request.filename, request.username) < 0) {
-                        fprintf(stderr, "[NM Handler] Warning: Failed to replicate CREATE to backup\n");
-                    }
+                    enqueue_replication_task(REP_OP_CREATE, request.filename, request.username);
+                    printf("[NM Handler] Enqueued async CREATE replication for '%s'\n", request.filename);
                 }
             }
             break;
@@ -147,11 +146,10 @@ void* handle_nm_connection(void *arg) {
             if (result < 0) {
                 response.error_code = ERR_FILE_NOT_FOUND;
             } else {
-                // Replicate to backup server if this is a primary server
+                // Replicate to backup server asynchronously (non-blocking)
                 if (server_config.is_primary) {
-                    if (replicate_delete(request.filename) < 0) {
-                        fprintf(stderr, "[NM Handler] Warning: Failed to replicate DELETE to backup\n");
-                    }
+                    enqueue_replication_task(REP_OP_DELETE, request.filename, NULL);
+                    printf("[NM Handler] Enqueued async DELETE replication for '%s'\n", request.filename);
                 }
             }
             break;
@@ -213,11 +211,10 @@ void* handle_nm_connection(void *arg) {
                 response.error_code = ERR_SUCCESS;
                 snprintf(response.data, MAX_DATA_SIZE, "Access granted successfully");
                 
-                // Replicate metadata to backup
+                // Replicate metadata to backup asynchronously
                 if (server_config.is_primary) {
-                    if (replicate_metadata() < 0) {
-                        fprintf(stderr, "[NM Handler] Warning: Failed to replicate metadata\n");
-                    }
+                    enqueue_replication_task(REP_OP_METADATA, "", NULL);
+                    printf("[NM Handler] Enqueued async metadata replication\n");
                 }
             }
             break;
@@ -240,11 +237,10 @@ void* handle_nm_connection(void *arg) {
                 response.error_code = ERR_SUCCESS;
                 snprintf(response.data, MAX_DATA_SIZE, "Access removed successfully");
                 
-                // Replicate metadata to backup
+                // Replicate metadata to backup asynchronously
                 if (server_config.is_primary) {
-                    if (replicate_metadata() < 0) {
-                        fprintf(stderr, "[NM Handler] Warning: Failed to replicate metadata\n");
-                    }
+                    enqueue_replication_task(REP_OP_METADATA, "", NULL);
+                    printf("[NM Handler] Enqueued async metadata replication\n");
                 }
             }
             break;

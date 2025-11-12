@@ -9,8 +9,145 @@
 #include <sys/stat.h>
 #include <pthread.h>
 
-// Mutex for backup operations
+// Mutex for backup operations (synchronous operations only)
 static pthread_mutex_t backup_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Replication worker thread
+static pthread_t replication_thread;
+
+// ============================================================================
+// ASYNCHRONOUS REPLICATION IMPLEMENTATION
+// ============================================================================
+
+// Initialize asynchronous replication queue and worker thread
+int init_async_replication() {
+    memset(&replication_queue, 0, sizeof(ReplicationQueue));
+    
+    pthread_mutex_init(&replication_queue.queue_mutex, NULL);
+    pthread_cond_init(&replication_queue.queue_not_empty, NULL);
+    pthread_cond_init(&replication_queue.queue_not_full, NULL);
+    
+    replication_queue.head = 0;
+    replication_queue.tail = 0;
+    replication_queue.count = 0;
+    replication_queue.running = 1;
+    
+    // Start replication worker thread
+    if (pthread_create(&replication_thread, NULL, async_replication_worker, NULL) != 0) {
+        fprintf(stderr, "[Async Replication] Failed to create worker thread\n");
+        return -1;
+    }
+    
+    printf("[Async Replication] Worker thread started\n");
+    return 0;
+}
+
+// Enqueue a replication task (non-blocking, asynchronous)
+int enqueue_replication_task(ReplicationOpType op_type, const char *filename, const char *owner) {
+    if (!server_config.is_primary || server_config.backup_sockfd < 0) {
+        // Not a primary server or backup not available
+        return 0;
+    }
+    
+    pthread_mutex_lock(&replication_queue.queue_mutex);
+    
+    // Check if queue is full
+    while (replication_queue.count >= REPLICATION_QUEUE_SIZE && replication_queue.running) {
+        fprintf(stderr, "[Async Replication] Queue full, waiting...\n");
+        pthread_cond_wait(&replication_queue.queue_not_full, &replication_queue.queue_mutex);
+    }
+    
+    if (!replication_queue.running) {
+        pthread_mutex_unlock(&replication_queue.queue_mutex);
+        return -1;
+    }
+    
+    // Add task to queue
+    ReplicationTask *task = &replication_queue.tasks[replication_queue.tail];
+    task->op_type = op_type;
+    strncpy(task->filename, filename, MAX_FILENAME - 1);
+    task->filename[MAX_FILENAME - 1] = '\0';
+    
+    if (owner) {
+        strncpy(task->owner, owner, MAX_USERNAME - 1);
+        task->owner[MAX_USERNAME - 1] = '\0';
+    } else {
+        task->owner[0] = '\0';
+    }
+    
+    replication_queue.tail = (replication_queue.tail + 1) % REPLICATION_QUEUE_SIZE;
+    replication_queue.count++;
+    
+    // Signal worker thread
+    pthread_cond_signal(&replication_queue.queue_not_empty);
+    pthread_mutex_unlock(&replication_queue.queue_mutex);
+    
+    printf("[Async Replication] Enqueued %s for file '%s' (queue size: %d)\n",
+           op_type == REP_OP_CREATE ? "CREATE" :
+           op_type == REP_OP_DELETE ? "DELETE" :
+           op_type == REP_OP_SYNC ? "SYNC" : "METADATA",
+           filename, replication_queue.count);
+    
+    return 0;  // Return immediately without waiting for ACK
+}
+
+// Asynchronous replication worker thread
+void* async_replication_worker(void *arg) {
+    (void)arg;
+    printf("[Async Replication] Worker thread running\n");
+    
+    while (1) {
+        pthread_mutex_lock(&replication_queue.queue_mutex);
+        
+        // Wait for tasks
+        while (replication_queue.count == 0 && replication_queue.running) {
+            pthread_cond_wait(&replication_queue.queue_not_empty, &replication_queue.queue_mutex);
+        }
+        
+        if (!replication_queue.running && replication_queue.count == 0) {
+            pthread_mutex_unlock(&replication_queue.queue_mutex);
+            break;
+        }
+        
+        // Get task from queue
+        ReplicationTask task = replication_queue.tasks[replication_queue.head];
+        replication_queue.head = (replication_queue.head + 1) % REPLICATION_QUEUE_SIZE;
+        replication_queue.count--;
+        
+        // Signal that queue has space
+        pthread_cond_signal(&replication_queue.queue_not_full);
+        pthread_mutex_unlock(&replication_queue.queue_mutex);
+        
+        // Process task (outside mutex to allow concurrent enqueuing)
+        printf("[Async Replication] Processing task: %s for '%s'\n",
+               task.op_type == REP_OP_CREATE ? "CREATE" :
+               task.op_type == REP_OP_DELETE ? "DELETE" :
+               task.op_type == REP_OP_SYNC ? "SYNC" : "METADATA",
+               task.filename);
+        
+        switch (task.op_type) {
+            case REP_OP_CREATE:
+                replicate_create(task.filename, task.owner);
+                break;
+            case REP_OP_DELETE:
+                replicate_delete(task.filename);
+                break;
+            case REP_OP_SYNC:
+                replicate_sync(task.filename);
+                break;
+            case REP_OP_METADATA:
+                replicate_metadata();
+                break;
+        }
+    }
+    
+    printf("[Async Replication] Worker thread exiting\n");
+    return NULL;
+}
+
+// ============================================================================
+// ORIGINAL SYNCHRONOUS BACKUP FUNCTIONS (now called by async worker)
+// ============================================================================
 
 // Initialize backup handler
 int init_backup_handler() {

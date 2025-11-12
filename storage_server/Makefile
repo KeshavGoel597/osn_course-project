@@ -10,7 +10,7 @@ SS_DIR = .
 
 # Source files
 COMMON_SRC = $(COMMON_DIR)/network_utils.c
-SS_SRC = storage_server.c file_handler_ll.c file_write_ll.c backup_handler.c ss_nm_comm.c ss_client_comm.c file_handler.c lock_manager.c 
+SS_SRC = storage_server.c file_handler_ll.c file_write_ll.c backup_handler.c ss_nm_comm.c ss_client_comm.c 
 
 # Object files
 COMMON_OBJ = $(COMMON_SRC:.c=.o)

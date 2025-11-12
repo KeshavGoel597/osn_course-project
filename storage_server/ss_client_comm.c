@@ -121,6 +121,9 @@ int handle_read_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
+    // Update last accessed time
+    update_file_accessed_time_ll(msg->filename, msg->username);
+    
     response.error_code = ERR_SUCCESS;
     send_message(client_sockfd, &response);
     printf("[READ] Successfully sent file content\n");
@@ -221,16 +224,16 @@ int handle_write_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
-    // Replicate changes to backup server if this is a primary server
+    // Update file modified timestamp
+    update_file_modified_time_ll(msg->filename);
+    
+    // Replicate changes to backup server asynchronously (non-blocking)
     if (server_config.is_primary) {
-        if (replicate_sync(msg->filename) < 0) {
-            fprintf(stderr, "[WRITE] Warning: Failed to replicate changes to backup\n");
-        } else {
-            printf("[WRITE] Successfully replicated changes to backup\n");
-        }
+        enqueue_replication_task(REP_OP_SYNC, msg->filename, NULL);
+        printf("[WRITE] Enqueued async replication for '%s'\n", msg->filename);
     }
     
-    // Send final success response
+    // Send final success response immediately (don't wait for backup ACK)
     Message final_response;
     memset(&final_response, 0, sizeof(Message));
     final_response.msg_type = MSG_ACK;
@@ -269,6 +272,9 @@ int handle_stream_request(int client_sockfd, Message *msg) {
         send_message(client_sockfd, &error_msg);
         return -1;
     }
+    
+    // Update last accessed time
+    update_file_accessed_time_ll(msg->filename, msg->username);
     
     printf("[STREAM] Starting to stream content word by word\n");
     

@@ -71,6 +71,9 @@ int init_name_server() {
     nm_state->next_primary_ss = 1;  // Start with SS1
     nm_state->running = 1;
     
+    // Initialize hash table for efficient file search (O(1))
+    init_file_hash_table();
+    
     // Create server socket
     nm_state->server_socket = create_socket();
     if (nm_state->server_socket < 0) {
@@ -233,6 +236,10 @@ void handle_connection(void *arg) {
             
         case OP_VIEW:
             handle_view_files(socket, &msg);
+            break;
+            
+        case OP_INFO:
+            handle_info_request(socket, &msg);
             break;
             
         case OP_EXEC:

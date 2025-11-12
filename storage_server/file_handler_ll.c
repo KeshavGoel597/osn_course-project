@@ -590,6 +590,12 @@ int lock_sentence_ll(const char *filename, int sentence_index, const char *usern
         return ERR_FILE_NOT_FOUND;
     }
     
+    // Validate sentence_index (must be non-negative and within range)
+    if (sentence_index < 0) {
+        printf("Lock FAILED: Negative sentence index %d for file '%s'\n", sentence_index, filename);
+        return ERR_SENTENCE_OUT_OF_RANGE;
+    }
+    
     // Traverse to target sentence
     SentenceNode *sent = file->sentences_head;
     int current_index = 0;
@@ -636,6 +642,12 @@ int unlock_sentence_ll(const char *filename, int sentence_index, const char *use
     LoadedFile *file = get_file_from_cache(filename);
     if (file == NULL) {
         return ERR_FILE_NOT_FOUND;
+    }
+    
+    // Validate sentence_index (must be non-negative)
+    if (sentence_index < 0) {
+        printf("Unlock FAILED: Negative sentence index %d for file '%s'\n", sentence_index, filename);
+        return -1;
     }
     
     // Traverse to target sentence
@@ -751,6 +763,31 @@ int update_file_metadata_ll(const char *filename, FileMetadata *metadata) {
     
     pthread_mutex_lock(&metadata_mutex);
     memcpy(meta, metadata, sizeof(FileMetadata));
+    pthread_mutex_unlock(&metadata_mutex);
+    save_metadata_ll();
+    return 0;
+}
+
+int update_file_modified_time_ll(const char *filename) {
+    FileMetadata *meta = find_metadata(filename);
+    if (meta == NULL) return ERR_FILE_NOT_FOUND;
+    
+    pthread_mutex_lock(&metadata_mutex);
+    get_timestamp(meta->modified_time, sizeof(meta->modified_time));
+    pthread_mutex_unlock(&metadata_mutex);
+    save_metadata_ll();
+    return 0;
+}
+
+int update_file_accessed_time_ll(const char *filename, const char *username) {
+    FileMetadata *meta = find_metadata(filename);
+    if (meta == NULL) return ERR_FILE_NOT_FOUND;
+    
+    pthread_mutex_lock(&metadata_mutex);
+    // Format: "2025-10-10 14:32 by user1"
+    char timestamp[64];
+    get_timestamp(timestamp, sizeof(timestamp));
+    snprintf(meta->accessed_time, sizeof(meta->accessed_time), "%s by %s", timestamp, username);
     pthread_mutex_unlock(&metadata_mutex);
     save_metadata_ll();
     return 0;

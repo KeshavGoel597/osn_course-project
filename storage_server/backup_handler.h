@@ -2,6 +2,34 @@
 #define BACKUP_HANDLER_H
 
 #include "../common/protocol.h"
+#include <pthread.h>
+
+// Asynchronous Replication Queue Types
+#define REPLICATION_QUEUE_SIZE 1000
+
+typedef enum {
+    REP_OP_CREATE,
+    REP_OP_DELETE,
+    REP_OP_SYNC,
+    REP_OP_METADATA
+} ReplicationOpType;
+
+typedef struct {
+    ReplicationOpType op_type;
+    char filename[MAX_FILENAME];
+    char owner[MAX_USERNAME];
+} ReplicationTask;
+
+typedef struct {
+    ReplicationTask tasks[REPLICATION_QUEUE_SIZE];
+    int head;
+    int tail;
+    int count;
+    pthread_mutex_t queue_mutex;
+    pthread_cond_t queue_not_empty;
+    pthread_cond_t queue_not_full;
+    int running;
+} ReplicationQueue;
 
 /**
  * Initialize backup handler
@@ -9,6 +37,24 @@
  * Or sets up listening for primary server if this is a backup server (even ID)
  */
 int init_backup_handler();
+
+/**
+ * Initialize asynchronous replication queue and worker thread
+ * Returns 0 on success, -1 on failure
+ */
+int init_async_replication();
+
+/**
+ * Asynchronous replication worker thread
+ * Processes tasks from replication queue
+ */
+void* async_replication_worker(void *arg);
+
+/**
+ * Enqueue a replication task (non-blocking, asynchronous)
+ * Returns immediately without waiting for ACK
+ */
+int enqueue_replication_task(ReplicationOpType op_type, const char *filename, const char *owner);
 
 /**
  * Connect to backup server (called by primary server)
@@ -69,6 +115,13 @@ int handle_nm_backup_info(const char *backup_ip, int backup_port);
  * Syncs all files, undo files, and metadata
  */
 int perform_bulk_sync();
+
+/**
+ * Request recovery sync from backup server (primary SS that was offline)
+ * This is called when a primary server comes back online after failure
+ * It requests all files from its backup to catch up on changes
+ */
+int request_recovery_sync_from_backup();
 
 /**
  * Replicate metadata.txt to backup server

@@ -15,6 +15,9 @@
 // Global server configuration
 SSConfig server_config;
 
+// Global replication queue for asynchronous backups
+ReplicationQueue replication_queue;
+
 // Global flag to control server running state
 volatile sig_atomic_t server_running = 1;
 
@@ -47,6 +50,13 @@ int init_storage_server(int nm_port, int client_port, const char *storage_dir) {
     // Initialize backup handler
     if (init_backup_handler() < 0) {
         fprintf(stderr, "Warning: Could not initialize backup handler\n");
+    }
+    
+    // Initialize asynchronous replication (for primary servers)
+    if (server_config.is_primary) {
+        if (init_async_replication() < 0) {
+            fprintf(stderr, "Warning: Could not initialize async replication\n");
+        }
     }
     
     printf("Storage Server initialized successfully\n");

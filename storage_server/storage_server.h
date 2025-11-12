@@ -2,6 +2,7 @@
 #define STORAGE_SERVER_H
 
 #include "../common/protocol.h"
+#include "backup_handler.h"  // For ReplicationQueue
 #include <pthread.h>
 
 // Global configuration
@@ -25,6 +26,9 @@ typedef struct {
 
 // Global server configuration
 extern SSConfig server_config;
+
+// Global replication queue for asynchronous backups
+extern ReplicationQueue replication_queue;
 
 // Thread argument structure
 typedef struct {
