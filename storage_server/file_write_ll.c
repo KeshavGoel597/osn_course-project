@@ -356,7 +356,7 @@ int save_undo_backup_ll(const char *filename) {
     }
     
     char undo_path[MAX_PATH];
-    snprintf(undo_path, MAX_PATH, "%s/undo/%s.undo", ".", filename);
+    get_undo_path(filename, undo_path, MAX_PATH);
     
     pthread_rwlock_rdlock(&file->file_rwlock);
     
