@@ -9,6 +9,10 @@ void* heartbeat_monitor(void* arg) {
     (void)arg;  // Suppress unused parameter warning
     printf("[Heartbeat Monitor] Started\n");
     
+    // CRITICAL FIX: Track consecutive failures per server
+    int consecutive_failures[MAX_STORAGE_SERVERS] = {0};
+    const int FAILURE_THRESHOLD = 3;  // Require 3 consecutive failures before marking offline
+    
     while (nm_state->running) {
         sleep(HEARTBEAT_INTERVAL);
         
@@ -21,27 +25,48 @@ void* heartbeat_monitor(void* arg) {
             
             pthread_mutex_lock(&ss->ss_mutex);
             
+            // CRITICAL FIX: Don't heartbeat servers that are recovering
+            if (ss->status == SS_STATUS_RECOVERING) {
+                pthread_mutex_unlock(&ss->ss_mutex);
+                continue;  // Skip heartbeat checks for recovering servers
+            }
+            
             if (ss->status == SS_STATUS_ONLINE || ss->status == SS_STATUS_ACTING_PRIMARY) {
                 // Check if heartbeat is overdue
                 time_t time_since_heartbeat = current_time - ss->last_heartbeat;
                 
                 if (time_since_heartbeat > HEARTBEAT_TIMEOUT) {
-                    printf("[Heartbeat Monitor] SS%d heartbeat timeout (%ld seconds)\n", 
-                           ss->ss_id, time_since_heartbeat);
+                    consecutive_failures[i]++;
+                    printf("[Heartbeat Monitor] SS%d heartbeat timeout (%ld seconds) - failure %d/%d\n", 
+                           ss->ss_id, time_since_heartbeat, consecutive_failures[i], FAILURE_THRESHOLD);
                     
-                    // Mark server as offline
-                    int old_status = ss->status;
-                    ss->status = SS_STATUS_OFFLINE;
-                    
-                    printf("[Failover] SS%d marked as OFFLINE\n", ss->ss_id);
-                    
-                    // If this was a primary server, handle failover
-                    if (old_status == SS_STATUS_ONLINE && ss->is_primary) {
-                        handle_storage_server_failure(ss->ss_id);
+                    // Only mark offline after multiple consecutive failures
+                    if (consecutive_failures[i] >= FAILURE_THRESHOLD) {
+                        // Mark server as offline
+                        int old_status = ss->status;
+                        ss->status = SS_STATUS_OFFLINE;
+                        
+                        printf("[Failover] SS%d marked as OFFLINE after %d consecutive failures\n", 
+                               ss->ss_id, consecutive_failures[i]);
+                        
+                        // If this was a primary server, handle failover
+                        if (old_status == SS_STATUS_ONLINE && ss->is_primary) {
+                            handle_storage_server_failure(ss->ss_id);
+                        }
+                        
+                        pthread_mutex_unlock(&ss->ss_mutex);
+                    } else {
+                        // Still within grace period - send heartbeat anyway
+                        pthread_mutex_unlock(&ss->ss_mutex);
+                        send_heartbeat_to_ss(ss->ss_id);
+                    }
+                } else {
+                    // Heartbeat is fresh - reset failure counter
+                    if (consecutive_failures[i] > 0) {
+                        printf("[Heartbeat Monitor] SS%d recovered (failures reset)\n", ss->ss_id);
+                        consecutive_failures[i] = 0;
                     }
                     
-                    pthread_mutex_unlock(&ss->ss_mutex);
-                } else {
                     // Send heartbeat ping
                     pthread_mutex_unlock(&ss->ss_mutex);
                     send_heartbeat_to_ss(ss->ss_id);
@@ -147,6 +172,10 @@ void handle_storage_server_failure(int failed_ss_id) {
     pthread_mutex_lock(&failed_ss->ss_mutex);
     int backup_ss_id = failed_ss->backup_ss_id;
     pthread_mutex_unlock(&failed_ss->ss_mutex);
+    
+    // CRITICAL FIX: Clear cache when server fails to prevent stale lookups
+    cache_clear();
+    printf("[Failover] Cache cleared due to server failure\n");
     
     if (backup_ss_id > 0) {
         int backup_ss_index = find_storage_server(backup_ss_id);
@@ -260,6 +289,7 @@ void print_server_status() {
             case SS_STATUS_ONLINE: status_str = "ONLINE"; break;
             case SS_STATUS_OFFLINE: status_str = "OFFLINE"; break;
             case SS_STATUS_ACTING_PRIMARY: status_str = "ACTING_PRIMARY"; break;
+            case SS_STATUS_RECOVERING: status_str = "RECOVERING"; break;
             default: status_str = "UNKNOWN"; break;
         }
         

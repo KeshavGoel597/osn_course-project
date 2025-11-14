@@ -84,6 +84,9 @@ int init_name_server() {
     // Initialize hash table for efficient file search (O(1))
     init_file_hash_table();
     
+    // Initialize file location cache for recent searches
+    init_file_cache();
+    
     // Initialize enhanced fault tolerance system
     if (initialize_replication_system() < 0) {
         printf("Error: Failed to initialize fault tolerance system\n");
@@ -217,6 +220,20 @@ void handle_connection(void *arg) {
     switch (msg.operation) {
         case OP_SS_REGISTER:
             handle_storage_server_registration(socket, &msg);
+            break;
+            
+        case OP_RECOVERY_SYNC:
+            // Storage server completed recovery sync
+            printf("[Recovery Sync] SS%d completed recovery sync\n", msg.ss_id);
+            handle_recovery_sync_complete(msg.ss_id);
+            {
+                Message ack = {0};
+                ack.msg_type = MSG_ACK;
+                ack.operation = OP_RECOVERY_SYNC;
+                ack.error_code = ERR_SUCCESS;
+                strcpy(ack.data, "Recovery sync acknowledged");
+                send_message(socket, &ack);
+            }
             break;
             
         case OP_CLIENT_REGISTER:

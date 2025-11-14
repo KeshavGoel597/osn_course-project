@@ -38,7 +38,7 @@ int send_read_request(const char *filename) {
         return -1;
     }
     
-    // Receive response
+    // CRITICAL FIX: Receive chunked response for large files
     Message response;
     if (receive_message(sockfd, &response) < 0) {
         fprintf(stderr, "Failed to receive READ response\n");
@@ -58,8 +58,50 @@ int send_read_request(const char *filename) {
         return -1;
     }
     
-    // Display file content
-    printf("%s\n", response.data);
+    // Check if this is a chunked transfer (file size in response)
+    long file_size = response.sentence_index;
+    
+    if (file_size <= MAX_DATA_SIZE - 100) {
+        // Small file - data is in first response
+        printf("%s\n", response.data);
+    } else {
+        // Large file - receive chunks
+        printf("[Receiving large file: %ld bytes]\n", file_size);
+        
+        size_t total_received = 0;
+        int chunk_num = 0;
+        
+        while (1) {
+            Message chunk_msg;
+            if (receive_message(sockfd, &chunk_msg) < 0) {
+                fprintf(stderr, "Failed to receive chunk\n");
+                break;
+            }
+            
+            if (chunk_msg.operation == OP_STOP) {
+                printf("\n[File transfer complete: %zu bytes received]\n", total_received);
+                break;
+            }
+            
+            if (chunk_msg.operation == OP_READ_CHUNK) {
+                size_t chunk_size = chunk_msg.sentence_index;
+                
+                // Write chunk data directly to stdout
+                fwrite(chunk_msg.data, 1, chunk_size, stdout);
+                fflush(stdout);
+                
+                total_received += chunk_size;
+                chunk_num++;
+                
+                if (chunk_num % 10 == 0) {
+                    fprintf(stderr, "\r[Received: %zu/%ld bytes (%d%%)]", 
+                           total_received, file_size, 
+                           (int)((total_received * 100) / file_size));
+                }
+            }
+        }
+        printf("\n");
+    }
     
     close_socket(sockfd);
     return 0;

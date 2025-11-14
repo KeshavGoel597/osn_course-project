@@ -6,6 +6,8 @@
 
 #include "../common/protocol.h"
 #include <pthread.h>
+#include <sys/socket.h>
+#include <errno.h>
 
 // ============================================================================
 // FILE HANDLER (Linked List Implementation) - from file_handler_ll.h
@@ -133,7 +135,7 @@ int is_backup_available();
 int handle_nm_backup_info(const char *backup_ip, int backup_port);
 int perform_bulk_sync();
 int perform_bulk_sync_to_backup();
-int request_recovery_sync_from_backup();
+int request_recovery_sync_from_backup(const char *backup_ip, int backup_port);
 int replicate_metadata();
 int send_bulk_file(const char *filename, int is_undo_file);
 int receive_bulk_sync(int sockfd);

@@ -46,15 +46,20 @@ CommandType parse_command(const char *input, ParsedCommand *cmd) {
         cmd->type = CMD_VIEW;
         cmd->view_flags = VIEW_FLAG_NONE;
         
-        // Check for flags
+        // Check for flags - FIXED: Exact match validation to reject invalid flags
         token = strtok(NULL, " \t\n");
         if (token != NULL && token[0] == '-') {
-            if (strstr(token, "a") && strstr(token, "l")) {
+            // Only accept exact matches: -al, -la, -a, -l
+            if (strcmp(token, "-al") == 0 || strcmp(token, "-la") == 0) {
                 cmd->view_flags = VIEW_FLAG_ALL_LONG;
-            } else if (strstr(token, "a")) {
+            } else if (strcmp(token, "-a") == 0) {
                 cmd->view_flags = VIEW_FLAG_ALL;
-            } else if (strstr(token, "l")) {
+            } else if (strcmp(token, "-l") == 0) {
                 cmd->view_flags = VIEW_FLAG_LONG;
+            } else {
+                // Invalid flag - reject command
+                fprintf(stderr, "Invalid flag '%s'. Valid flags: -a, -l, -al\n", token);
+                return CMD_UNKNOWN;
             }
         }
         return CMD_VIEW;

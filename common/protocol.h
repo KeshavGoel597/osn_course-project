@@ -57,6 +57,8 @@
 #define OP_NM_BACKUP_INFO 305   // NM sends backup server info to primary SS
 #define OP_SS_ADDACCESS 306     // NM instructs SS to add access permissions
 #define OP_SS_REMACCESS 307     // NM instructs SS to remove access permissions
+#define OP_READ_CHUNK 308       // SS sends file chunk during chunked READ
+#define OP_EXEC_CHUNK 309       // SS sends script chunk during chunked EXEC
 
 // Backup/Replication Operations
 #define OP_BACKUP_CREATE 400    // Primary SS instructs backup SS to create file
@@ -68,6 +70,7 @@
 #define OP_BACKUP_FILE 406      // Primary SS sends a file during bulk sync
 #define OP_BACKUP_UNDO_FILE 407 // Primary SS sends an undo file during bulk sync
 #define OP_BACKUP_SYNC_COMPLETE 408 // Primary SS completes bulk sync
+#define OP_RECOVERY_SYNC 409    // NM instructs recovering primary to sync from backup
 
 // Error Codes
 #define ERR_SUCCESS 0

@@ -172,6 +172,12 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     // If appending new sentence
     if (target_sent == NULL) {
         target_sent = create_sentence_node('\0');
+        // CRITICAL FIX: Check malloc success
+        if (target_sent == NULL) {
+            fprintf(stderr, "[Write LL] Failed to allocate new sentence node\n");
+            pthread_rwlock_unlock(&file->file_rwlock);
+            return -1;
+        }
         if (prev_sent != NULL) {
             prev_sent->next = target_sent;
         } else {
@@ -305,8 +311,14 @@ extern void get_file_path(const char *filename, char *path, size_t size);
 extern void get_undo_path(const char *filename, char *path, size_t size);
 extern int unload_file_from_memory(const char *filename);
 
+// Global mutex for UNDO operations to prevent concurrent access
+static pthread_mutex_t undo_mutex = PTHREAD_MUTEX_INITIALIZER;
+
 // Undo implementation
 int undo_file_change_ll(const char *filename) {
+    // CRITICAL FIX: Lock to prevent concurrent UNDO operations on same file
+    pthread_mutex_lock(&undo_mutex);
+    
     char filepath[MAX_PATH];
     char undo_path[MAX_PATH];
     get_file_path(filename, filepath, MAX_PATH);
@@ -316,6 +328,7 @@ int undo_file_change_ll(const char *filename) {
     FILE *undo_fp = fopen(undo_path, "r");
     if (undo_fp == NULL) {
         fprintf(stderr, "No undo history for file '%s'\n", filename);
+        pthread_mutex_unlock(&undo_mutex);
         return -1;
     }
     fclose(undo_fp);
@@ -328,6 +341,7 @@ int undo_file_change_ll(const char *filename) {
         if (src) fclose(src);
         if (dst) fclose(dst);
         fprintf(stderr, "Failed to restore undo backup for '%s'\n", filename);
+        pthread_mutex_unlock(&undo_mutex);
         return -1;
     }
     
@@ -342,6 +356,8 @@ int undo_file_change_ll(const char *filename) {
     
     // Unload file from memory cache to force reload on next access
     unload_file_from_memory(filename);
+    
+    pthread_mutex_unlock(&undo_mutex);
     
     printf("Undo completed for '%s', restored to previous version\n", filename);
     return 0;

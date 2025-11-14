@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/stat.h>
 
 // Handle client connection (runs in separate thread)
 void* handle_client_connection(void *arg) {
@@ -70,6 +71,13 @@ void* handle_client_connection(void *arg) {
                 response.error_code = ERR_SERVER_ERROR;
             } else {
                 response.error_code = ERR_SUCCESS;
+                
+                // CRITICAL FIX: Replicate restored file to backup server
+                // UNDO changes the file content, so backup must be synchronized
+                if (server_config.is_primary || server_config.is_acting_primary) {
+                    enqueue_replication_task(REP_OP_SYNC, request.filename, NULL);
+                    printf("[UNDO] Enqueued async replication for '%s'\n", request.filename);
+                }
             }
             
             send_message(client_sockfd, &response);
@@ -109,8 +117,13 @@ int handle_read_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
-    // Read file content
-    if (read_file_ll(msg->filename, response.data, MAX_DATA_SIZE) < 0) {
+    // CRITICAL FIX: Implement chunked transfer for large files
+    // Get file path and size
+    char filepath[MAX_PATH];
+    get_file_path(msg->filename, filepath, MAX_PATH);
+    
+    FILE *file = fopen(filepath, "r");
+    if (file == NULL) {
         printf("[READ] File not found: %s\n", msg->filename);
         response.msg_type = MSG_ERROR;
         response.error_code = ERR_FILE_NOT_FOUND;
@@ -118,12 +131,70 @@ int handle_read_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    printf("[READ] File size: %ld bytes\n", file_size);
+    
+    // Send initial response with file size
+    response.error_code = ERR_SUCCESS;
+    response.sentence_index = file_size;  // Use sentence_index to send file size
+    snprintf(response.data, MAX_DATA_SIZE, "FILE_SIZE:%ld", file_size);
+    
+    if (send_message(client_sockfd, &response) < 0) {
+        fclose(file);
+        return -1;
+    }
+    
+    // Send file content in chunks
+    char buffer[MAX_DATA_SIZE - 100];  // Leave room for metadata
+    size_t bytes_sent = 0;
+    size_t chunk_num = 0;
+    
+    while (bytes_sent < (size_t)file_size) {
+        size_t to_read = (file_size - bytes_sent > sizeof(buffer)) ? 
+                         sizeof(buffer) : file_size - bytes_sent;
+        
+        size_t bytes_read = fread(buffer, 1, to_read, file);
+        if (bytes_read == 0) break;
+        
+        Message chunk_msg;
+        memset(&chunk_msg, 0, sizeof(Message));
+        chunk_msg.msg_type = MSG_RESPONSE;
+        chunk_msg.operation = OP_READ_CHUNK;
+        chunk_msg.error_code = ERR_SUCCESS;
+        chunk_msg.sentence_index = bytes_read;  // Chunk size
+        memcpy(chunk_msg.data, buffer, bytes_read);
+        
+        if (send_message(client_sockfd, &chunk_msg) < 0) {
+            fprintf(stderr, "[READ] Failed to send chunk %zu\n", chunk_num);
+            fclose(file);
+            return -1;
+        }
+        
+        bytes_sent += bytes_read;
+        chunk_num++;
+        printf("[READ] Sent chunk %zu: %zu bytes (%zu/%ld total)\n", 
+               chunk_num, bytes_read, bytes_sent, file_size);
+    }
+    
+    fclose(file);
+    
+    // Send STOP message to indicate end of transfer
+    Message stop_msg;
+    memset(&stop_msg, 0, sizeof(Message));
+    stop_msg.msg_type = MSG_RESPONSE;
+    stop_msg.operation = OP_STOP;
+    stop_msg.error_code = ERR_SUCCESS;
+    strcpy(stop_msg.data, "READ_COMPLETE");
+    send_message(client_sockfd, &stop_msg);
+    
     // Update last accessed time
     update_file_accessed_time_ll(msg->filename, msg->username);
     
-    response.error_code = ERR_SUCCESS;
-    send_message(client_sockfd, &response);
-    printf("[READ] Successfully sent file content\n");
+    printf("[READ] Successfully sent %zu bytes in %zu chunks\n", bytes_sent, chunk_num);
     return 0;
 }
 
@@ -146,6 +217,28 @@ int handle_write_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
+    // CRITICAL: Check file size to prevent memory exhaustion
+    // WRITE uses in-memory linked lists, so we must limit file size
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s", server_config.storage_dir, msg->filename);
+    
+    struct stat file_stat;
+    if (stat(filepath, &file_stat) == 0) {
+        // File exists - check size (10MB limit for WRITE operations)
+        #define MAX_WRITE_FILE_SIZE (10 * 1024 * 1024)  // 10MB
+        
+        if (file_stat.st_size > MAX_WRITE_FILE_SIZE) {
+            printf("[WRITE] File too large: %ld bytes (limit: %d bytes)\n", 
+                   file_stat.st_size, MAX_WRITE_FILE_SIZE);
+            response.msg_type = MSG_ERROR;
+            response.error_code = ERR_SERVER_ERROR;
+            snprintf(response.data, MAX_DATA_SIZE, 
+                     "File too large for WRITE operation (limit: 10MB)");
+            send_message(client_sockfd, &response);
+            return -1;
+        }
+    }
+    
     // Try to lock the sentence
     int lock_result = lock_sentence_ll(msg->filename, msg->sentence_index, msg->username);
     if (lock_result != 0) {
@@ -161,6 +254,17 @@ int handle_write_request(int client_sockfd, Message *msg) {
     strcpy(response.data, "LOCKED");
     send_message(client_sockfd, &response);
     printf("[WRITE] Sentence locked, waiting for write commands\n");
+    
+    // CRITICAL FIX: Ensure file is cached before creating undo backup
+    // get_file_from_cache() loads file from disk if not in memory
+    if (get_file_from_cache(msg->filename) == NULL) {
+        fprintf(stderr, "[WRITE] Failed to load file into cache for undo backup\n");
+        unlock_sentence_ll(msg->filename, msg->sentence_index, msg->username);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        send_message(client_sockfd, &response);
+        return -1;
+    }
     
     // Save backup for undo before making changes
     save_undo_backup_ll(msg->filename);
@@ -270,9 +374,13 @@ int handle_stream_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
-    // Read file content
-    char content[MAX_DATA_SIZE];
-    if (read_file_ll(msg->filename, content, MAX_DATA_SIZE) < 0) {
+    // Get full file path
+    char filepath[512];
+    snprintf(filepath, sizeof(filepath), "%s/%s", server_config.storage_dir, msg->filename);
+    
+    // Open file directly for streaming
+    FILE *file = fopen(filepath, "r");
+    if (!file) {
         printf("[STREAM] File not found: %s\n", msg->filename);
         Message error_msg;
         memset(&error_msg, 0, sizeof(Message));
@@ -282,31 +390,79 @@ int handle_stream_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
+    // Get file size
+    fseek(file, 0, SEEK_END);
+    long file_size = ftell(file);
+    fseek(file, 0, SEEK_SET);
+    
+    printf("[STREAM] File size: %ld bytes - starting word-by-word stream\n", file_size);
+    
     // Update last accessed time
     update_file_accessed_time_ll(msg->filename, msg->username);
     
-    printf("[STREAM] Starting to stream content word by word\n");
+    // Stream file content word by word
+    // Read file in chunks, parse into words, send with delays
+    char buffer[MAX_DATA_SIZE - 100];
+    char word_buffer[MAX_DATA_SIZE];
+    int word_pos = 0;
+    size_t bytes_read;
     
-    // Parse content into words and send one by one
-    char *token = strtok(content, " \t\n\r");
-    while (token != NULL) {
+    while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        for (size_t i = 0; i < bytes_read; i++) {
+            char c = buffer[i];
+            
+            // Check if character is a word delimiter
+            if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                // If we have accumulated a word, send it
+                if (word_pos > 0) {
+                    word_buffer[word_pos] = '\0';
+                    
+                    Message word_msg;
+                    memset(&word_msg, 0, sizeof(Message));
+                    word_msg.msg_type = MSG_RESPONSE;
+                    word_msg.operation = OP_STREAM_WORD;
+                    word_msg.error_code = ERR_SUCCESS;
+                    strncpy(word_msg.data, word_buffer, MAX_DATA_SIZE - 1);
+                    
+                    if (send_message(client_sockfd, &word_msg) < 0) {
+                        fprintf(stderr, "[STREAM] Failed to send word, client disconnected\n");
+                        fclose(file);
+                        return -1;
+                    }
+                    
+                    // Sleep for 0.1 seconds (100,000 microseconds)
+                    usleep(100000);
+                    
+                    word_pos = 0;
+                }
+            } else {
+                // Accumulate character into current word
+                if (word_pos < MAX_DATA_SIZE - 1) {
+                    word_buffer[word_pos++] = c;
+                }
+            }
+        }
+    }
+    
+    // Send any remaining word
+    if (word_pos > 0) {
+        word_buffer[word_pos] = '\0';
+        
         Message word_msg;
         memset(&word_msg, 0, sizeof(Message));
         word_msg.msg_type = MSG_RESPONSE;
         word_msg.operation = OP_STREAM_WORD;
         word_msg.error_code = ERR_SUCCESS;
-        strncpy(word_msg.data, token, MAX_DATA_SIZE - 1);
+        strncpy(word_msg.data, word_buffer, MAX_DATA_SIZE - 1);
         
         if (send_message(client_sockfd, &word_msg) < 0) {
             fprintf(stderr, "[STREAM] Failed to send word, client disconnected\n");
+            fclose(file);
             return -1;
         }
-        
-        // Sleep for 0.1 seconds (100,000 microseconds)
-        usleep(100000);
-        
-        token = strtok(NULL, " \t\n\r");
     }
+    
+    fclose(file);
     
     // Send STOP message to indicate end of stream
     Message stop_msg;

@@ -248,9 +248,12 @@ int main(int argc, char *argv[]) {
     }
     
     // Register with Name Server
+    // CRITICAL FIX: Don't allow offline mode - NM is required for all operations
     if (register_with_nm() < 0) {
         fprintf(stderr, "Failed to register with Name Server\n");
-        fprintf(stderr, "Continuing in offline mode (limited functionality)\n");
+        fprintf(stderr, "Name Server connection is required for NFS operations.\n");
+        fprintf(stderr, "Please ensure the Name Server is running and try again.\n");
+        return 1;  // Exit instead of continuing in offline mode
     }
     
     // Start interactive shell

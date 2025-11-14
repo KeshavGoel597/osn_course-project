@@ -130,6 +130,10 @@ void* handle_nm_connection(void *arg) {
             if (result < 0) {
                 response.error_code = (result == ERR_FILE_EXISTS) ? ERR_FILE_EXISTS : ERR_SERVER_ERROR;
             } else {
+                // CRITICAL FIX: Save empty undo backup so first write can be undone
+                save_undo_backup_ll(request.filename);
+                printf("[NM Handler] Created initial UNDO backup for '%s'\n", request.filename);
+                
                 // Replicate to backup server asynchronously (non-blocking)
                 if (server_config.is_primary) {
                     enqueue_replication_task(REP_OP_CREATE, request.filename, request.username);
@@ -178,16 +182,82 @@ void* handle_nm_connection(void *arg) {
         case OP_EXEC: {
             printf("[NM Handler] EXEC request: %s\n", request.filename);
             
-            // Read file content for execution
-            char content[MAX_DATA_SIZE];
-            if (read_file_ll(request.filename, content, MAX_DATA_SIZE) < 0) {
+            // Get full file path
+            char filepath[512];
+            snprintf(filepath, sizeof(filepath), "%s/%s", server_config.storage_dir, request.filename);
+            
+            // Open file directly
+            FILE *file = fopen(filepath, "r");
+            if (!file) {
                 response.error_code = ERR_FILE_NOT_FOUND;
-            } else {
-                // Send file content back to NM (NM will execute it)
-                strncpy(response.data, content, MAX_DATA_SIZE - 1);
-                response.msg_type = MSG_RESPONSE;
+                break;
             }
-            break;
+            
+            // Get file size
+            fseek(file, 0, SEEK_END);
+            long file_size = ftell(file);
+            fseek(file, 0, SEEK_SET);
+            
+            printf("[NM Handler] EXEC file size: %ld bytes\n", file_size);
+            
+            // Send initial response with file size
+            response.msg_type = MSG_RESPONSE;
+            response.error_code = ERR_SUCCESS;
+            response.sentence_index = file_size;  // Send file size
+            
+            if (send_message(nm_sockfd, &response) < 0) {
+                fprintf(stderr, "[NM Handler] Failed to send initial EXEC response\n");
+                fclose(file);
+                close_socket(nm_sockfd);
+                return NULL;
+            }
+            
+            // Send file content in chunks
+            char buffer[MAX_DATA_SIZE - 100];
+            size_t bytes_read;
+            size_t bytes_sent = 0;
+            int chunk_num = 0;
+            int send_failed = 0;
+            
+            while ((bytes_read = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+                Message chunk_msg;
+                memset(&chunk_msg, 0, sizeof(Message));
+                chunk_msg.msg_type = MSG_RESPONSE;
+                chunk_msg.operation = OP_EXEC_CHUNK;
+                chunk_msg.error_code = ERR_SUCCESS;
+                chunk_msg.sentence_index = bytes_read;  // Chunk size
+                memcpy(chunk_msg.data, buffer, bytes_read);
+                
+                if (send_message(nm_sockfd, &chunk_msg) < 0) {
+                    fprintf(stderr, "[NM Handler] Failed to send EXEC chunk %d\n", chunk_num);
+                    send_failed = 1;
+                    break;
+                }
+                
+                bytes_sent += bytes_read;
+                chunk_num++;
+                printf("[NM Handler] Sent EXEC chunk %d: %zu bytes (total: %zu/%ld)\n", 
+                       chunk_num, bytes_read, bytes_sent, file_size);
+            }
+            
+            fclose(file);
+            
+            if (!send_failed) {
+                // Send STOP message to indicate completion
+                Message stop_msg;
+                memset(&stop_msg, 0, sizeof(Message));
+                stop_msg.msg_type = MSG_RESPONSE;
+                stop_msg.operation = OP_STOP;
+                stop_msg.error_code = ERR_SUCCESS;
+                
+                send_message(nm_sockfd, &stop_msg);
+                printf("[NM Handler] EXEC transfer complete: %zu bytes in %d chunks\n", 
+                       bytes_sent, chunk_num);
+            }
+            
+            // Close connection and return (don't send standard response)
+            close_socket(nm_sockfd);
+            return NULL;
         }
         
         case OP_SS_ADDACCESS: {
@@ -263,6 +333,47 @@ void* handle_nm_connection(void *arg) {
                 response.error_code = ERR_CONNECTION_FAILED;
             } else {
                 printf("[NM Handler] Successfully handled backup info\n");
+            }
+            break;
+        }
+        
+        case OP_RECOVERY_SYNC: {
+            // CRITICAL FIX: NM commanding this primary to sync from backup
+            printf("[Recovery Sync] Received recovery sync command from NM\n");
+            printf("[Recovery Sync] Backup server: %s:%d (SS%d)\n", 
+                   request.backup_ip, request.backup_port, request.ss_id);
+            
+            // Mark this server as syncing
+            server_config.is_acting_primary = 0;
+            
+            // Request full bulk sync from backup (which is currently acting primary)
+            if (request_recovery_sync_from_backup(request.backup_ip, request.backup_port) < 0) {
+                fprintf(stderr, "[Recovery Sync] ERROR: Failed to sync from backup\n");
+                response.error_code = ERR_SERVER_ERROR;
+                strcpy(response.data, "Recovery sync failed");
+            } else {
+                printf("[Recovery Sync] Successfully completed recovery sync from backup\n");
+                response.error_code = ERR_SUCCESS;
+                strcpy(response.data, "Recovery sync completed");
+                
+                // Notify Name Server that recovery is complete
+                int nm_sockfd = connect_to_server(NM_IP, NM_PORT);
+                if (nm_sockfd >= 0) {
+                    Message notify;
+                    memset(&notify, 0, sizeof(Message));
+                    notify.msg_type = MSG_REQUEST;
+                    notify.operation = OP_RECOVERY_SYNC;
+                    notify.ss_id = server_config.ss_id;
+                    strcpy(notify.data, "Recovery sync complete");
+                    
+                    send_message(nm_sockfd, &notify);
+                    
+                    Message nm_ack;
+                    receive_message(nm_sockfd, &nm_ack);
+                    close(nm_sockfd);
+                    
+                    printf("[Recovery Sync] Notified NM of recovery completion\n");
+                }
             }
             break;
         }

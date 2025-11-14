@@ -81,6 +81,32 @@ void handle_get_ss_info(int socket, Message *msg) {
     printf("[File Location] Client '%s' requesting location for file '%s'\n", 
            msg->username, msg->filename);
     
+    // Try cache first for O(1) lookup
+    int cached_primary_ss_id, cached_backup_ss_id;
+    if (cache_lookup(msg->filename, &cached_primary_ss_id, &cached_backup_ss_id)) {
+        // Cache hit! Use cached values
+        printf("[File Location] Cache HIT - Using cached location\n");
+        
+        // Verify the server is still online
+        int ss_index = find_storage_server(cached_primary_ss_id);
+        if (ss_index >= 0 && nm_state->storage_servers[ss_index].status != SS_STATUS_OFFLINE) {
+            // Send cached info
+            Message response = {0};
+            response.msg_type = MSG_RESPONSE;
+            response.operation = OP_GET_SS_INFO;
+            response.error_code = ERR_SUCCESS;
+            response.ss_id = cached_primary_ss_id;
+            strcpy(response.ip, nm_state->storage_servers[ss_index].ip);
+            response.port1 = nm_state->storage_servers[ss_index].client_port;
+            send_message(socket, &response);
+            log_operation("GET_SS_INFO_CACHED", msg->filename);
+            return;
+        }
+        // If server is offline, fall through to do full lookup and update cache
+        printf("[File Location] Cached server offline, performing full lookup\n");
+    }
+    
+    // Cache miss or stale - do full lookup
     FileInfo *file = find_file(msg->filename);
     
     Message response = {0};
@@ -97,6 +123,9 @@ void handle_get_ss_info(int socket, Message *msg) {
     
     printf("[File Location] File found: primary_ss_id=%d, backup_ss_id=%d, owner=%s\n",
            file->primary_ss_id, file->backup_ss_id, file->owner);
+    
+    // Update cache with current location
+    cache_insert(msg->filename, file->primary_ss_id, file->backup_ss_id);
     
     // Find the appropriate server (primary or acting backup)
     int target_ss_id = file->primary_ss_id;
@@ -375,6 +404,10 @@ void handle_delete_file(int socket, Message *msg) {
     // If storage server deletion was successful, remove from our records
     if (ss_response.error_code == ERR_SUCCESS) {
         remove_file_from_server(primary_ss_id, msg->filename);
+        
+        // Invalidate cache entry for deleted file
+        cache_invalidate(msg->filename);
+        
         printf("[File Deletion] File '%s' deleted successfully from SS%d\n", msg->filename, primary_ss_id);
         log_operation("FILE_DELETE", msg->filename);
         
@@ -999,10 +1032,9 @@ void handle_exec(int socket, Message *msg) {
         return;
     }
     
-    close(ss_socket);
-    
     // Check if SS returned an error
     if (ss_response.error_code != ERR_SUCCESS) {
+        close(ss_socket);
         response.msg_type = MSG_ERROR;
         response.error_code = ss_response.error_code;
         strcpy(response.data, ss_response.data);
@@ -1011,9 +1043,67 @@ void handle_exec(int socket, Message *msg) {
         return;
     }
     
+    // Get file size from initial response
+    long file_size = ss_response.sentence_index;
+    printf("[File Exec] File size: %ld bytes\n", file_size);
+    
+    // Allocate buffer for file content
+    char *file_content = malloc(file_size + 1);
+    if (!file_content) {
+        close(ss_socket);
+        response.msg_type = MSG_ERROR;
+        response.error_code = ERR_SERVER_ERROR;
+        strcpy(response.data, "Out of memory");
+        printf("[File Exec] Failed to allocate %ld bytes for file content\n", file_size);
+        send_message(socket, &response);
+        return;
+    }
+    
+    // Receive file content in chunks
+    size_t total_received = 0;
+    int chunk_num = 0;
+    
+    while (total_received < file_size) {
+        Message chunk_msg = {0};
+        if (receive_message(ss_socket, &chunk_msg) < 0) {
+            free(file_content);
+            close(ss_socket);
+            response.msg_type = MSG_ERROR;
+            response.error_code = ERR_SERVER_ERROR;
+            strcpy(response.data, "Failed to receive file chunk");
+            printf("[File Exec] Failed to receive chunk from SS%d\n", file->primary_ss_id);
+            send_message(socket, &response);
+            return;
+        }
+        
+        // Check for STOP message
+        if (chunk_msg.operation == OP_STOP) {
+            printf("[File Exec] Received STOP after %zu bytes\n", total_received);
+            break;
+        }
+        
+        if (chunk_msg.operation == OP_EXEC_CHUNK) {
+            size_t chunk_size = chunk_msg.sentence_index;
+            memcpy(file_content + total_received, chunk_msg.data, chunk_size);
+            total_received += chunk_size;
+            chunk_num++;
+            
+            if (chunk_num % 10 == 0) {
+                printf("[File Exec] Received chunk %d: %zu/%ld bytes\n", 
+                       chunk_num, total_received, file_size);
+            }
+        }
+    }
+    
+    file_content[total_received] = '\0';
+    printf("[File Exec] Received complete file: %zu bytes in %d chunks\n", 
+           total_received, chunk_num);
+    
+    close(ss_socket);
+    
     // 4. Execute the file content as shell commands on Name Server
     printf("[File Exec] Executing commands from file '%s'\n", msg->filename);
-    printf("[File Exec] File content:\n%s\n", ss_response.data);
+    printf("[File Exec] File content:\n%s\n", file_content);
     
     // Create a temporary file to hold the commands
     char temp_file[256];
@@ -1022,6 +1112,7 @@ void handle_exec(int socket, Message *msg) {
     
     FILE *fp = fopen(temp_file, "w");
     if (!fp) {
+        free(file_content);
         response.msg_type = MSG_ERROR;
         response.error_code = ERR_SERVER_ERROR;
         strcpy(response.data, "Failed to create temporary execution file");
@@ -1031,8 +1122,11 @@ void handle_exec(int socket, Message *msg) {
     }
     
     // Write the commands to temp file
-    fprintf(fp, "%s", ss_response.data);
+    fprintf(fp, "%s", file_content);
     fclose(fp);
+    
+    // Free the file content buffer (no longer needed)
+    free(file_content);
     
     // Execute the commands and capture output
     char exec_cmd[512];
@@ -1961,8 +2055,6 @@ void handle_rejectrequest(int socket, Message *msg) {
         send_message(socket, &response);
         return;
     }
-    
-   
     
     // Verify ownership
     if (strcmp(req->owner, msg->username) != 0) {

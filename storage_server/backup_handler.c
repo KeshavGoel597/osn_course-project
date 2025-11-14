@@ -47,6 +47,23 @@ int enqueue_replication_task(ReplicationOpType op_type, const char *filename, co
         return 0;
     }
     
+    // CRITICAL FIX: Verify backup connection is actually healthy
+    // Use MSG_PEEK to check if socket is still valid without consuming data
+    char probe_byte;
+    int result = recv(server_config.backup_sockfd, &probe_byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (result == 0) {
+        // Connection closed by backup server
+        fprintf(stderr, "[Async Replication] Backup connection closed, skipping enqueue\n");
+        server_config.backup_sockfd = -1;
+        return -1;
+    } else if (result < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+        // Socket error (not just empty buffer)
+        fprintf(stderr, "[Async Replication] Backup socket error: %s, skipping enqueue\n", strerror(errno));
+        server_config.backup_sockfd = -1;
+        return -1;
+    }
+    // If EAGAIN/EWOULDBLOCK or result > 0, socket is healthy
+    
     pthread_mutex_lock(&replication_queue.queue_mutex);
     
     // Check if queue is full
@@ -1025,5 +1042,67 @@ int perform_bulk_sync_to_backup() {
     }
     
     printf("[Bulk Sync] Bulk synchronization completed: %d files synced\n", files_synced);
+    return 0;
+}
+
+// ============================================================================
+// CRITICAL FIX: Recovery Sync - Primary pulls data from backup after failure
+// ============================================================================
+
+int request_recovery_sync_from_backup(const char *backup_ip, int backup_port) {
+    printf("[Recovery Sync] Initiating recovery sync from backup at %s:%d\n", backup_ip, backup_port);
+    
+    // Clear all existing files and metadata - backup is source of truth
+    printf("[Recovery Sync] Clearing stale local data...\n");
+    char clear_cmd[MAX_PATH];
+    snprintf(clear_cmd, MAX_PATH, "rm -rf %s/files/* %s/metadata.txt", 
+             server_config.storage_dir, server_config.storage_dir);
+    system(clear_cmd);
+    
+    // Recreate files directory
+    char files_dir[MAX_PATH];
+    snprintf(files_dir, MAX_PATH, "%s/files", server_config.storage_dir);
+    mkdir(files_dir, 0755);
+    
+    printf("[Recovery Sync] Cleared local data, connecting to backup...\n");
+    
+    // Connect to backup server (which is currently acting as primary)
+    int backup_sockfd = connect_to_server(backup_ip, backup_port);
+    if (backup_sockfd < 0) {
+        fprintf(stderr, "[Recovery Sync] Failed to connect to backup server\n");
+        return -1;
+    }
+    
+    printf("[Recovery Sync] Connected to backup, requesting bulk sync...\n");
+    
+    // Request bulk sync from backup (reuse existing bulk sync protocol)
+    Message sync_request = {0};
+    sync_request.msg_type = MSG_REQUEST;
+    sync_request.operation = OP_BACKUP_INIT_SYNC;
+    sync_request.ss_id = server_config.ss_id;
+    strcpy(sync_request.data, "RECOVERY_SYNC");
+    
+    if (send_message(backup_sockfd, &sync_request) < 0) {
+        fprintf(stderr, "[Recovery Sync] Failed to send sync request\n");
+        close(backup_sockfd);
+        return -1;
+    }
+    
+    // Receive bulk sync data (same as normal backup would do)
+    int result = receive_bulk_sync(backup_sockfd);
+    close(backup_sockfd);
+    
+    if (result < 0) {
+        fprintf(stderr, "[Recovery Sync] Bulk sync from backup failed\n");
+        return -1;
+    }
+    
+    printf("[Recovery Sync] Successfully synced all data from backup\n");
+    printf("[Recovery Sync] Reloading metadata...\n");
+    
+    // Reload metadata after sync
+    load_metadata_ll();
+    
+    printf("[Recovery Sync] Recovery sync complete - server is up to date\n");
     return 0;
 }

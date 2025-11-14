@@ -5,6 +5,7 @@
 #include <unistd.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -80,6 +81,22 @@ int connect_to_server(const char *ip, int port) {
         return -1;
     }
     
+    // CRITICAL FIX: Set timeout to prevent hanging when server is unresponsive
+    // 5-second timeout for both send and receive operations
+    struct timeval timeout;
+    timeout.tv_sec = 5;
+    timeout.tv_usec = 0;
+    
+    if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
+        print_error("Warning: Failed to set receive timeout");
+        // Don't fail - continue with no timeout
+    }
+    
+    if (setsockopt(sockfd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+        print_error("Warning: Failed to set send timeout");
+        // Don't fail - continue with no timeout
+    }
+    
     struct sockaddr_in server_addr;
     memset(&server_addr, 0, sizeof(server_addr));
     
@@ -115,6 +132,10 @@ int send_message(int sockfd, Message *msg) {
     while (total_sent < bytes_to_send) {
         int sent = send(sockfd, msg_ptr + total_sent, bytes_to_send - total_sent, 0);
         if (sent < 0) {
+            // CRITICAL FIX: Retry on EINTR (interrupted system call)
+            if (errno == EINTR) {
+                continue;  // Retry the send
+            }
             print_error("Error sending message");
             return -1;
         }
@@ -142,6 +163,10 @@ int receive_message(int sockfd, Message *msg) {
     while (total_received < bytes_to_receive) {
         int received = recv(sockfd, msg_ptr + total_received, bytes_to_receive - total_received, 0);
         if (received < 0) {
+            // CRITICAL FIX: Retry on EINTR (interrupted system call)
+            if (errno == EINTR) {
+                continue;  // Retry the recv
+            }
             print_error("Error receiving message");
             return -1;
         }

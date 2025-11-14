@@ -8,6 +8,9 @@ CACHING NOT IMPLEMENTED
 ACCESS LOOKUP SHOULD BE SUBLINEAR TIME
 NEED TO TEST BONUS FUNCTIONALITIES
 HIERARCHICAL STURTURE WORKS BY COPYING FILES BUT IT SHOULD MOVE IT NOT COPY
+
+DOUBTS:
+EXEC ls written in the file: does it display the files in the storage server storage_data1/2/3 subdirectory, name server or client subdirectory?
 ---
 
 # 🚀 FAULT TOLERANCE IMPLEMENTATION - COMPLETE

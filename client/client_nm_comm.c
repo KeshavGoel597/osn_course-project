@@ -323,28 +323,46 @@ int send_delete_request(const char *filename) {
 
 // Send EXEC request to Name Server
 int send_exec_request(const char *filename) {
-    int sockfd = connect_to_nm();
-    if (sockfd < 0) return -1;
+    printf("=== EXEC: Executing commands from file '%s' ===\n", filename);
     
+    // Get SS info for the file
+    char ss_ip[MAX_IP_LEN];
+    int ss_port;
+    
+    if (get_ss_info(filename, ss_ip, &ss_port) < 0) {
+        return -1;
+    }
+    
+    // Connect to storage server to read file
+    int sockfd = connect_to_server(ss_ip, ss_port);
+    if (sockfd < 0) {
+        fprintf(stderr, "Failed to connect to Storage Server\n");
+        return -1;
+    }
+    
+    // Send READ request
     Message request;
     memset(&request, 0, sizeof(Message));
     request.msg_type = MSG_REQUEST;
-    request.operation = OP_EXEC;
+    request.operation = OP_READ;
     strncpy(request.username, client_config.username, MAX_USERNAME - 1);
     strncpy(request.filename, filename, MAX_FILENAME - 1);
     
     if (send_message(sockfd, &request) < 0) {
-        fprintf(stderr, "Failed to send EXEC request\n");
+        fprintf(stderr, "Failed to send READ request\n");
         close_socket(sockfd);
         return -1;
     }
     
+    // Receive file content
     Message response;
     if (receive_message(sockfd, &response) < 0) {
-        fprintf(stderr, "Failed to receive EXEC response\n");
+        fprintf(stderr, "Failed to receive file content\n");
         close_socket(sockfd);
         return -1;
     }
+    
+    close_socket(sockfd);
     
     if (response.msg_type == MSG_ERROR) {
         if (response.error_code == ERR_FILE_NOT_FOUND) {
@@ -354,14 +372,43 @@ int send_exec_request(const char *filename) {
         } else {
             fprintf(stderr, "Error: %d\n", response.error_code);
         }
-        close_socket(sockfd);
         return -1;
     }
     
-    // Display execution output
-    printf("%s\n", response.data);
+    // Execute commands locally on client machine
+    printf("\n--- Output ---\n");
     
-    close_socket(sockfd);
+    // Create temporary script file
+    FILE *script_file = fopen("/tmp/nfs_exec_script.sh", "w");
+    if (!script_file) {
+        fprintf(stderr, "Error: Failed to create temporary script file\n");
+        return -1;
+    }
+    
+    fprintf(script_file, "#!/bin/bash\n%s\n", response.data);
+    fclose(script_file);
+    
+    // Make executable
+    system("chmod +x /tmp/nfs_exec_script.sh");
+    
+    // Execute and capture output
+    FILE *output = popen("/tmp/nfs_exec_script.sh 2>&1", "r");
+    if (!output) {
+        fprintf(stderr, "Error: Failed to execute script\n");
+        system("rm -f /tmp/nfs_exec_script.sh");
+        return -1;
+    }
+    
+    char line[256];
+    while (fgets(line, sizeof(line), output)) {
+        printf("%s", line);
+    }
+    
+    pclose(output);
+    system("rm -f /tmp/nfs_exec_script.sh");
+    
+    printf("\n--- Execution Complete ---\n");
+    
     return 0;
 }
 

@@ -25,6 +25,150 @@ static FileMetadata metadata_list[MAX_FILES];
 static int metadata_count = 0;
 static pthread_mutex_t metadata_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Access control cache for O(1) lookups
+// Hash table: key = "filename:username", value = access_type (R=1, W=2, RW=3)
+#define ACCESS_CACHE_SIZE 10007  // Prime number for better distribution
+typedef struct AccessCacheEntry {
+    char key[MAX_FILENAME + MAX_USERNAME + 2];  // "filename:username"
+    int access_type;  // 1=READ, 2=WRITE, 3=READ_WRITE
+    int valid;
+    struct AccessCacheEntry *next;  // For chaining
+} AccessCacheEntry;
+
+static AccessCacheEntry access_cache[ACCESS_CACHE_SIZE];
+static pthread_mutex_t access_cache_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Hash function for access cache
+static unsigned int hash_access_key(const char *key) {
+    unsigned int hash = 5381;
+    int c;
+    while ((c = *key++))
+        hash = ((hash << 5) + hash) + c; // hash * 33 + c
+    return hash % ACCESS_CACHE_SIZE;
+}
+
+// Build access cache for a file (parse access_list and populate hash table)
+static void build_access_cache_for_file(const char *filename, const char *access_list) {
+    pthread_mutex_lock(&access_cache_mutex);
+    
+    // Parse access_list: format is "user1:R,user2:RW,user3:R,..."
+    char list_copy[MAX_DATA_SIZE];
+    strncpy(list_copy, access_list, MAX_DATA_SIZE - 1);
+    list_copy[MAX_DATA_SIZE - 1] = '\0';
+    
+    char *entry = strtok(list_copy, ",");
+    while (entry != NULL) {
+        // Parse "username:R" or "username:RW"
+        char *colon = strchr(entry, ':');
+        if (colon != NULL) {
+            *colon = '\0';
+            char *username = entry;
+            char *access_str = colon + 1;
+            
+            // Create cache key
+            char cache_key[MAX_FILENAME + MAX_USERNAME + 2];
+            snprintf(cache_key, sizeof(cache_key), "%s:%s", filename, username);
+            
+            // Determine access type
+            int access_type = 0;
+            if (strcmp(access_str, "R") == 0) {
+                access_type = 1;
+            } else if (strcmp(access_str, "RW") == 0) {
+                access_type = 3;
+            }
+            
+            if (access_type > 0) {
+                // Insert into hash table
+                unsigned int hash = hash_access_key(cache_key);
+                AccessCacheEntry *entry_ptr = &access_cache[hash];
+                
+                // Check if entry already exists
+                int found = 0;
+                if (entry_ptr->valid && strcmp(entry_ptr->key, cache_key) == 0) {
+                    entry_ptr->access_type = access_type;
+                    found = 1;
+                } else {
+                    // Linear probing for collision resolution
+                    for (int i = 1; i < ACCESS_CACHE_SIZE && !found; i++) {
+                        unsigned int probe_hash = (hash + i) % ACCESS_CACHE_SIZE;
+                        entry_ptr = &access_cache[probe_hash];
+                        if (!entry_ptr->valid) {
+                            strncpy(entry_ptr->key, cache_key, sizeof(entry_ptr->key) - 1);
+                            entry_ptr->access_type = access_type;
+                            entry_ptr->valid = 1;
+                            found = 1;
+                            break;
+                        } else if (strcmp(entry_ptr->key, cache_key) == 0) {
+                            entry_ptr->access_type = access_type;
+                            found = 1;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        entry = strtok(NULL, ",");
+    }
+    
+    pthread_mutex_unlock(&access_cache_mutex);
+}
+
+// Invalidate access cache for a file
+static void invalidate_access_cache_for_file(const char *filename) {
+    pthread_mutex_lock(&access_cache_mutex);
+    
+    for (int i = 0; i < ACCESS_CACHE_SIZE; i++) {
+        if (access_cache[i].valid) {
+            // Check if key starts with filename:
+            char prefix[MAX_FILENAME + 2];
+            snprintf(prefix, sizeof(prefix), "%s:", filename);
+            if (strncmp(access_cache[i].key, prefix, strlen(prefix)) == 0) {
+                access_cache[i].valid = 0;
+            }
+        }
+    }
+    
+    pthread_mutex_unlock(&access_cache_mutex);
+}
+
+// Lookup access in cache - O(1) average case
+static int lookup_access_cache(const char *filename, const char *username, int required_access) {
+    char cache_key[MAX_FILENAME + MAX_USERNAME + 2];
+    snprintf(cache_key, sizeof(cache_key), "%s:%s", filename, username);
+    
+    pthread_mutex_lock(&access_cache_mutex);
+    
+    unsigned int hash = hash_access_key(cache_key);
+    AccessCacheEntry *entry_ptr = &access_cache[hash];
+    
+    // Check direct hash location
+    if (entry_ptr->valid && strcmp(entry_ptr->key, cache_key) == 0) {
+        int has_access = (entry_ptr->access_type & required_access) == required_access;
+        pthread_mutex_unlock(&access_cache_mutex);
+        return has_access;
+    }
+    
+    // Linear probing
+    for (int i = 1; i < ACCESS_CACHE_SIZE; i++) {
+        unsigned int probe_hash = (hash + i) % ACCESS_CACHE_SIZE;
+        entry_ptr = &access_cache[probe_hash];
+        
+        if (!entry_ptr->valid) {
+            // Not found in cache
+            break;
+        }
+        
+        if (strcmp(entry_ptr->key, cache_key) == 0) {
+            int has_access = (entry_ptr->access_type & required_access) == required_access;
+            pthread_mutex_unlock(&access_cache_mutex);
+            return has_access;
+        }
+    }
+    
+    pthread_mutex_unlock(&access_cache_mutex);
+    return 0;  // Not found in cache = no access
+}
+
 // Helper function to get current timestamp
 void get_timestamp(char *buffer, size_t size) {
     time_t now = time(NULL);
@@ -53,6 +197,11 @@ int init_file_handler_ll(const char *storage_directory) {
     mkdir(storage_dir, 0755);
     mkdir(files_dir, 0755);
     mkdir(undo_dir, 0755);
+    
+    // CRITICAL FIX: Initialize access control cache
+    memset(access_cache, 0, sizeof(access_cache));
+    pthread_mutex_init(&access_cache_mutex, NULL);
+    printf("Access control cache initialized (%d entries)\n", ACCESS_CACHE_SIZE);
     
     printf("File handler (linked list) initialized\n");
     printf("  Files directory: %s\n", files_dir);
@@ -784,29 +933,42 @@ int has_read_access_ll(const char *filename, const char *username) {
     FileMetadata *meta = find_metadata(filename);
     if (meta == NULL) return 0;
     
+    // Owner always has access
     if (strcmp(meta->owner, username) == 0) return 1;
     
-    char search[128];
-    snprintf(search, sizeof(search), "%s:R", username);
-    if (strstr(meta->access_list, search) != NULL) return 1;
+    // OPTIMIZED: Try cache first - O(1) lookup
+    int cache_result = lookup_access_cache(filename, username, 1);  // 1 = READ access
+    if (cache_result) {
+        return 1;
+    }
     
-    snprintf(search, sizeof(search), "%s:RW", username);
-    if (strstr(meta->access_list, search) != NULL) return 1;
+    // Cache miss - parse access_list and rebuild cache
+    // This happens only when cache is cold or invalidated
+    build_access_cache_for_file(filename, meta->access_list);
     
-    return 0;
+    // Try cache again after rebuild
+    return lookup_access_cache(filename, username, 1);
 }
 
 int has_write_access_ll(const char *filename, const char *username) {
     FileMetadata *meta = find_metadata(filename);
     if (meta == NULL) return 0;
     
+    // Owner always has access
     if (strcmp(meta->owner, username) == 0) return 1;
     
-    char search[128];
-    snprintf(search, sizeof(search), "%s:RW", username);
-    if (strstr(meta->access_list, search) != NULL) return 1;
+    // OPTIMIZED: Try cache first - O(1) lookup
+    // Write requires bit 2 set (RW=3 has bit 2 set)
+    int cache_result = lookup_access_cache(filename, username, 2);  // 2 = WRITE access
+    if (cache_result) {
+        return 1;
+    }
     
-    return 0;
+    // Cache miss - parse access_list and rebuild cache
+    build_access_cache_for_file(filename, meta->access_list);
+    
+    // Try cache again after rebuild
+    return lookup_access_cache(filename, username, 2);
 }
 
 int get_file_metadata_ll(const char *filename, FileMetadata *metadata) {
@@ -898,6 +1060,10 @@ int add_user_access_ll(const char *filename, const char *username, int access_ty
     
     strncat(meta->access_list, access_str, MAX_DATA_SIZE - strlen(meta->access_list) - 1);
     printf("[Access Control] Updated access list: %s\n", meta->access_list);
+    
+    // CRITICAL: Invalidate access cache after permission change
+    invalidate_access_cache_for_file(filename);
+    
     pthread_mutex_unlock(&metadata_mutex);
     
     save_metadata_ll();
@@ -933,6 +1099,9 @@ int remove_user_access_ll(const char *filename, const char *username) {
             *pos = '\0';
         }
     }
+    
+    // CRITICAL: Invalidate access cache after permission change
+    invalidate_access_cache_for_file(filename);
     
     pthread_mutex_unlock(&metadata_mutex);
     save_metadata_ll();

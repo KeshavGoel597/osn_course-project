@@ -255,10 +255,39 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
+    // CRITICAL FIX: Validate command line arguments
     int ss_id = atoi(argv[1]);
     int nm_port = atoi(argv[2]);
     int client_port = atoi(argv[3]);
     const char *storage_dir = argv[4];
+    
+    // Validate ss_id
+    if (ss_id <= 0 || ss_id > 100) {
+        fprintf(stderr, "Error: SS_ID must be between 1 and 100\n");
+        return 1;
+    }
+    
+    // Validate ports
+    if (nm_port <= 1024 || nm_port > 65535) {
+        fprintf(stderr, "Error: NM port must be between 1025 and 65535\n");
+        return 1;
+    }
+    
+    if (client_port <= 1024 || client_port > 65535) {
+        fprintf(stderr, "Error: Client port must be between 1025 and 65535\n");
+        return 1;
+    }
+    
+    if (nm_port == client_port) {
+        fprintf(stderr, "Error: NM port and Client port must be different\n");
+        return 1;
+    }
+    
+    // Validate storage directory path
+    if (strlen(storage_dir) == 0 || strlen(storage_dir) >= MAX_PATH) {
+        fprintf(stderr, "Error: Invalid storage directory path\n");
+        return 1;
+    }
     
     // Determine if this is a primary or backup server
     server_config.ss_id = ss_id;

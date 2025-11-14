@@ -106,6 +106,24 @@ typedef struct {
     int auto_failover_enabled;
 } ReplicationPairInfo;
 
+// Cache Entry for Recent File Searches (LRU Cache)
+#define CACHE_SIZE 100
+#define CACHE_TTL 60  // Cache entries expire after 60 seconds
+
+typedef struct CacheEntry {
+    char filename[MAX_FILENAME];
+    int primary_ss_id;
+    int backup_ss_id;
+    time_t timestamp;
+    int valid;  // 1 if entry is valid, 0 if empty
+} CacheEntry;
+
+typedef struct {
+    CacheEntry entries[CACHE_SIZE];
+    int next_evict_index;  // Simple round-robin eviction
+    pthread_mutex_t cache_mutex;
+} FileLocationCache;
+
 // Global Name Server State
 typedef struct {
     StorageServerInfo storage_servers[MAX_STORAGE_SERVERS];
@@ -117,6 +135,8 @@ typedef struct {
     pthread_mutex_t client_list_mutex;
     
     FileHashTable file_index;  // Hash table for O(1) file lookups
+    
+    FileLocationCache search_cache;  // LRU cache for recent file searches
     
     AccessRequest access_requests[MAX_ACCESS_REQUESTS];
     int request_count;
@@ -153,6 +173,7 @@ int find_backup_for_primary(int primary_ss_id);
 void setup_backup_pairing(int primary_ss_id);
 void handle_storage_server_failure(int ss_id);
 void promote_backup_to_primary(int backup_ss_id, int failed_primary_ss_id);
+void handle_recovery_sync_complete(int ss_id);  // NEW: Called when SS completes recovery sync
 
 // Hash Table Functions for Efficient File Search (O(1))
 void init_file_hash_table();
@@ -160,6 +181,13 @@ unsigned int hash_filename(const char *filename);
 void hash_insert_file(FileInfo *file);
 void hash_remove_file(const char *filename);
 FileInfo* hash_find_file(const char *filename);
+
+// Cache Functions for Recent File Searches
+void init_file_cache();
+void cache_insert(const char *filename, int primary_ss_id, int backup_ss_id);
+int cache_lookup(const char *filename, int *primary_ss_id, int *backup_ss_id);
+void cache_invalidate(const char *filename);
+void cache_clear();
 
 // Client management
 int register_client(Message *msg);
