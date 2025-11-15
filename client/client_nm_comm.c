@@ -362,9 +362,8 @@ int send_exec_request(const char *filename) {
         return -1;
     }
     
-    close_socket(sockfd);
-    
     if (response.msg_type == MSG_ERROR) {
+        close_socket(sockfd);
         if (response.error_code == ERR_FILE_NOT_FOUND) {
             fprintf(stderr, "Error: File '%s' not found\n", filename);
         } else if (response.error_code == ERR_NO_READ_ACCESS) {
@@ -375,8 +374,50 @@ int send_exec_request(const char *filename) {
         return -1;
     }
     
+    close_socket(sockfd);
+    
+    // Handle both small files (content in response.data) and large files (chunked)
+    char *file_content = NULL;
+    long file_size = response.sentence_index;
+    
+    if (file_size <= MAX_DATA_SIZE - 100) {
+        // Small file - content is directly in response.data
+        file_content = strdup(response.data);
+    } else {
+        fprintf(stderr, "Error: File too large for EXEC operation (%ld bytes)\n", file_size);
+        return -1;
+    }
+    
+    if (!file_content) {
+        fprintf(stderr, "Error: Failed to read file content\n");
+        return -1;
+    }
+    
     // Execute commands locally on client machine
     printf("\n--- Output ---\n");
+    
+    // Write content to temporary script file
+    FILE *temp_file = fopen("/tmp/nfs_exec_script.sh", "w");
+    if (!temp_file) {
+        fprintf(stderr, "Error: Cannot create temporary script file\n");
+        free(file_content);
+        return -1;
+    }
+    
+    fprintf(temp_file, "#!/bin/bash\n%s", file_content);
+    fclose(temp_file);
+    
+    // Make it executable and run it
+    system("chmod +x /tmp/nfs_exec_script.sh");
+    int result = system("/tmp/nfs_exec_script.sh");
+    
+    // Cleanup
+    unlink("/tmp/nfs_exec_script.sh");
+    free(file_content);
+    
+    printf("\n--- Execution Complete ---\n");
+    
+    return (result == 0) ? 0 : -1;
     
     // Create temporary script file
     FILE *script_file = fopen("/tmp/nfs_exec_script.sh", "w");

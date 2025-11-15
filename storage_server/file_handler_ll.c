@@ -926,6 +926,67 @@ int force_unlock_all_sentences_ll(const char *filename) {
     return 0;
 }
 
+// Update file statistics (word count, character count, file size) after write operations
+int update_file_statistics_ll(const char *filename) {
+    FileMetadata *meta = find_metadata(filename);
+    if (meta == NULL) return ERR_FILE_NOT_FOUND;
+    
+    char filepath[MAX_PATH];
+    get_file_path(filename, filepath, MAX_PATH);
+    
+    FILE *fp = fopen(filepath, "r");
+    if (fp == NULL) {
+        fprintf(stderr, "Failed to open file for statistics update: %s\n", filename);
+        return ERR_FILE_NOT_FOUND;
+    }
+    
+    // Calculate file size
+    fseek(fp, 0, SEEK_END);
+    long file_size = ftell(fp);
+    fseek(fp, 0, SEEK_SET);
+    
+    // Count words and characters
+    int word_count = 0;
+    int char_count = 0;
+    int in_word = 0;
+    int c;
+    
+    while ((c = fgetc(fp)) != EOF) {
+        char_count++;
+        
+        if (isspace(c) || c == '.' || c == '!' || c == '?') {
+            if (in_word) {
+                word_count++;
+                in_word = 0;
+            }
+        } else {
+            in_word = 1;
+        }
+    }
+    
+    // Handle last word if file doesn't end with whitespace
+    if (in_word) {
+        word_count++;
+    }
+    
+    fclose(fp);
+    
+    // Update metadata
+    pthread_mutex_lock(&metadata_mutex);
+    meta->file_size = file_size;
+    meta->word_count = word_count;
+    meta->char_count = char_count;
+    pthread_mutex_unlock(&metadata_mutex);
+    
+    // Save updated metadata to disk
+    save_metadata_ll();
+    
+    printf("[Stats] Updated statistics for '%s': %d words, %d chars, %ld bytes\n", 
+           filename, word_count, char_count, file_size);
+    
+    return 0;
+}
+
 // Write functions are implemented in file_write_ll.c
 
 // Access control functions (same logic as before)

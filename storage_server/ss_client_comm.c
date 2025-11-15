@@ -72,6 +72,9 @@ void* handle_client_connection(void *arg) {
             } else {
                 response.error_code = ERR_SUCCESS;
                 
+                // Update file statistics after UNDO
+                update_file_statistics_ll(request.filename);
+                
                 // CRITICAL FIX: Replicate restored file to backup server
                 // UNDO changes the file content, so backup must be synchronized
                 if (server_config.is_primary || server_config.is_acting_primary) {
@@ -117,6 +120,9 @@ int handle_read_request(int client_sockfd, Message *msg) {
         return -1;
     }
     
+    // Update accessed time when file is read
+    update_file_accessed_time_ll(msg->filename, msg->username);
+    
     // CRITICAL FIX: Implement chunked transfer for large files
     // Get file path and size
     char filepath[MAX_PATH];
@@ -138,63 +144,78 @@ int handle_read_request(int client_sockfd, Message *msg) {
     
     printf("[READ] File size: %ld bytes\n", file_size);
     
-    // Send initial response with file size
     response.error_code = ERR_SUCCESS;
     response.sentence_index = file_size;  // Use sentence_index to send file size
-    snprintf(response.data, MAX_DATA_SIZE, "FILE_SIZE:%ld", file_size);
     
-    if (send_message(client_sockfd, &response) < 0) {
-        fclose(file);
-        return -1;
-    }
-    
-    // Send file content in chunks
-    char buffer[MAX_DATA_SIZE - 100];  // Leave room for metadata
-    size_t bytes_sent = 0;
-    size_t chunk_num = 0;
-    
-    while (bytes_sent < (size_t)file_size) {
-        size_t to_read = (file_size - bytes_sent > sizeof(buffer)) ? 
-                         sizeof(buffer) : file_size - bytes_sent;
+    // For small files, send content directly in first response
+    if (file_size <= MAX_DATA_SIZE - 100) {
+        size_t bytes_read = fread(response.data, 1, file_size, file);
+        response.data[bytes_read] = '\0';  // Null terminate for safety
         
-        size_t bytes_read = fread(buffer, 1, to_read, file);
-        if (bytes_read == 0) break;
-        
-        Message chunk_msg;
-        memset(&chunk_msg, 0, sizeof(Message));
-        chunk_msg.msg_type = MSG_RESPONSE;
-        chunk_msg.operation = OP_READ_CHUNK;
-        chunk_msg.error_code = ERR_SUCCESS;
-        chunk_msg.sentence_index = bytes_read;  // Chunk size
-        memcpy(chunk_msg.data, buffer, bytes_read);
-        
-        if (send_message(client_sockfd, &chunk_msg) < 0) {
-            fprintf(stderr, "[READ] Failed to send chunk %zu\n", chunk_num);
+        if (send_message(client_sockfd, &response) < 0) {
             fclose(file);
             return -1;
         }
         
-        bytes_sent += bytes_read;
-        chunk_num++;
-        printf("[READ] Sent chunk %zu: %zu bytes (%zu/%ld total)\n", 
-               chunk_num, bytes_read, bytes_sent, file_size);
+        printf("[READ] Sent small file directly: %ld bytes\n", file_size);
+    } else {
+        // Large file - send file size first, then chunks
+        snprintf(response.data, MAX_DATA_SIZE, "FILE_SIZE:%ld", file_size);
+        
+        if (send_message(client_sockfd, &response) < 0) {
+            fclose(file);
+            return -1;
+        }
+        
+        // Send file content in chunks
+        char buffer[MAX_DATA_SIZE - 100];  // Leave room for metadata
+        size_t bytes_sent = 0;
+        size_t chunk_num = 0;
+        
+        while (bytes_sent < (size_t)file_size) {
+            size_t to_read = (file_size - bytes_sent > sizeof(buffer)) ? 
+                             sizeof(buffer) : file_size - bytes_sent;
+            
+            size_t bytes_read = fread(buffer, 1, to_read, file);
+            if (bytes_read == 0) break;
+            
+            Message chunk_msg;
+            memset(&chunk_msg, 0, sizeof(Message));
+            chunk_msg.msg_type = MSG_RESPONSE;
+            chunk_msg.operation = OP_READ_CHUNK;
+            chunk_msg.error_code = ERR_SUCCESS;
+            chunk_msg.sentence_index = bytes_read;  // Chunk size
+            memcpy(chunk_msg.data, buffer, bytes_read);
+            
+            if (send_message(client_sockfd, &chunk_msg) < 0) {
+                fprintf(stderr, "[READ] Failed to send chunk %zu\n", chunk_num);
+                fclose(file);
+                return -1;
+            }
+            
+            bytes_sent += bytes_read;
+            chunk_num++;
+            printf("[READ] Sent chunk %zu: %zu bytes (%zu/%ld total)\n", 
+                   chunk_num, bytes_read, bytes_sent, file_size);
+        }
+        
+        // Send STOP message to indicate end of transfer
+        Message stop_msg;
+        memset(&stop_msg, 0, sizeof(Message));
+        stop_msg.msg_type = MSG_RESPONSE;
+        stop_msg.operation = OP_STOP;
+        stop_msg.error_code = ERR_SUCCESS;
+        strcpy(stop_msg.data, "READ_COMPLETE");
+        send_message(client_sockfd, &stop_msg);
+        
+        printf("[READ] Successfully sent %zu bytes in %zu chunks\n", bytes_sent, chunk_num);
     }
     
     fclose(file);
     
-    // Send STOP message to indicate end of transfer
-    Message stop_msg;
-    memset(&stop_msg, 0, sizeof(Message));
-    stop_msg.msg_type = MSG_RESPONSE;
-    stop_msg.operation = OP_STOP;
-    stop_msg.error_code = ERR_SUCCESS;
-    strcpy(stop_msg.data, "READ_COMPLETE");
-    send_message(client_sockfd, &stop_msg);
-    
     // Update last accessed time
     update_file_accessed_time_ll(msg->filename, msg->username);
     
-    printf("[READ] Successfully sent %zu bytes in %zu chunks\n", bytes_sent, chunk_num);
     return 0;
 }
 
@@ -340,6 +361,9 @@ int handle_write_request(int client_sockfd, Message *msg) {
     // Update file modified timestamp
     update_file_modified_time_ll(msg->filename);
     
+    // Update file statistics (word count, character count, file size)
+    update_file_statistics_ll(msg->filename);
+    
     // Replicate changes to backup server asynchronously (non-blocking)
     if (server_config.is_primary) {
         enqueue_replication_task(REP_OP_SYNC, msg->filename, NULL);
@@ -375,8 +399,8 @@ int handle_stream_request(int client_sockfd, Message *msg) {
     }
     
     // Get full file path
-    char filepath[512];
-    snprintf(filepath, sizeof(filepath), "%s/%s", server_config.storage_dir, msg->filename);
+    char filepath[MAX_PATH];
+    get_file_path(msg->filename, filepath, MAX_PATH);
     
     // Open file directly for streaming
     FILE *file = fopen(filepath, "r");

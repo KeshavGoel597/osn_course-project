@@ -72,6 +72,7 @@ int undo_file_change_ll(const char *filename);
 int get_file_metadata_ll(const char *filename, FileMetadata *metadata);
 int update_file_metadata_ll(const char *filename, FileMetadata *metadata);
 int update_file_modified_time_ll(const char *filename);
+int update_file_statistics_ll(const char *filename);
 int update_file_accessed_time_ll(const char *filename, const char *username);
 int has_read_access_ll(const char *filename, const char *username);
 int has_write_access_ll(const char *filename, const char *username);

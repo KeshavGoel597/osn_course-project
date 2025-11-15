@@ -1,4 +1,4 @@
-.specstory
+/.specstory
 storage_data*
 *.o
 storage_server/storage_server
