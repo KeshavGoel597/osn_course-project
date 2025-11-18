@@ -7,7 +7,7 @@
 
 // Helper to connect to Name Server
 static int connect_to_nm() {
-    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    int sockfd = connect_to_server(client_config.nm_ip, NM_PORT);
     if (sockfd < 0) {
         fprintf(stderr, "Failed to connect to Name Server\n");
         return -1;
@@ -325,163 +325,59 @@ int send_delete_request(const char *filename) {
 int send_exec_request(const char *filename) {
     printf("=== EXEC: Executing commands from file '%s' ===\n", filename);
     
-    // Get SS info for the file
-    char ss_ip[MAX_IP_LEN];
-    int ss_port;
+    // CRITICAL FIX: Send OP_EXEC to Name Server for SERVER-SIDE execution
+    // The specification requires execution on the Name Server, NOT the client
+    // Previous implementation was a SECURITY VIOLATION (Remote File Execution on client)
     
-    if (get_ss_info(filename, ss_ip, &ss_port) < 0) {
-        return -1;
-    }
+    int sockfd = connect_to_nm();
+    if (sockfd < 0) return -1;
     
-    // Connect to storage server to read file
-    int sockfd = connect_to_server(ss_ip, ss_port);
-    if (sockfd < 0) {
-        fprintf(stderr, "Failed to connect to Storage Server\n");
-        return -1;
-    }
-    
-    // Send READ request
     Message request;
     memset(&request, 0, sizeof(Message));
     request.msg_type = MSG_REQUEST;
-    request.operation = OP_READ;
+    request.operation = OP_EXEC;
     strncpy(request.username, client_config.username, MAX_USERNAME - 1);
     strncpy(request.filename, filename, MAX_FILENAME - 1);
     
     if (send_message(sockfd, &request) < 0) {
-        fprintf(stderr, "Failed to send READ request\n");
+        fprintf(stderr, "Failed to send EXEC request\n");
         close_socket(sockfd);
         return -1;
     }
     
-    // Receive file content
+    // Receive execution output from Name Server
     Message response;
     if (receive_message(sockfd, &response) < 0) {
-        fprintf(stderr, "Failed to receive file content\n");
+        fprintf(stderr, "Failed to receive EXEC response\n");
         close_socket(sockfd);
         return -1;
-    }
-    
-    if (response.msg_type == MSG_ERROR) {
-        close_socket(sockfd);
-        if (response.error_code == ERR_FILE_NOT_FOUND) {
-            fprintf(stderr, "Error: File '%s' not found\n", filename);
-        } else if (response.error_code == ERR_NO_READ_ACCESS) {
-            fprintf(stderr, "Error: No read access to file '%s'\n", filename);
-        } else {
-            fprintf(stderr, "Error: %d\n", response.error_code);
-        }
-        return -1;
-    }
-    
-    // Handle both small files (content in response.data) and large files (chunked)
-    char *file_content = NULL;
-    long file_size = response.sentence_index;
-    
-    if (file_size <= MAX_DATA_SIZE - 100) {
-        // Small file - content is directly in response.data
-        file_content = strdup(response.data);
-    } else {
-        // CRITICAL FIX: Large file - receive chunks
-        printf("[EXEC] Receiving large file: %ld bytes\n", file_size);
-        
-        // Allocate buffer for entire file
-        file_content = (char*)malloc(file_size + 1);
-        if (!file_content) {
-            fprintf(stderr, "Error: Failed to allocate memory for file content\n");
-            close_socket(sockfd);
-            return -1;
-        }
-        
-        size_t total_received = 0;
-        
-        while (total_received < (size_t)file_size) {
-            Message chunk_msg;
-            if (receive_message(sockfd, &chunk_msg) < 0) {
-                fprintf(stderr, "Error: Failed to receive chunk\n");
-                free(file_content);
-                close_socket(sockfd);
-                return -1;
-            }
-            
-            if (chunk_msg.operation == OP_STOP) {
-                break;
-            }
-            
-            if (chunk_msg.operation == OP_READ_CHUNK) {
-                size_t chunk_size = chunk_msg.sentence_index;
-                memcpy(file_content + total_received, chunk_msg.data, chunk_size);
-                total_received += chunk_size;
-            }
-        }
-        
-        file_content[total_received] = '\0';
-        printf("[EXEC] Received %zu bytes\n", total_received);
     }
     
     close_socket(sockfd);
     
-    if (!file_content) {
-        fprintf(stderr, "Error: Failed to read file content\n");
+    if (response.msg_type == MSG_ERROR) {
+        if (response.error_code == ERR_FILE_NOT_FOUND) {
+            fprintf(stderr, "Error: File '%s' not found\n", filename);
+        } else if (response.error_code == ERR_NO_READ_ACCESS) {
+            fprintf(stderr, "Error: No read access to file '%s'\n", filename);
+        } else if (response.error_code == ERR_SERVER_ERROR) {
+            fprintf(stderr, "Error: Execution failed on server\n");
+            if (strlen(response.data) > 0) {
+                fprintf(stderr, "Details: %s\n", response.data);
+            }
+        } else {
+            fprintf(stderr, "Error: %d - %s\n", response.error_code, response.data);
+        }
         return -1;
     }
     
-    // Execute commands locally on client machine
-    printf("\n--- Output ---\n");
-    
-    // Write content to temporary script file
-    FILE *temp_file = fopen("/tmp/nfs_exec_script.sh", "w");
-    if (!temp_file) {
-        fprintf(stderr, "Error: Cannot create temporary script file\n");
-        free(file_content);
-        return -1;
+    // Display output from server-side execution
+    printf("\n--- Execution Output (from Name Server) ---\n");
+    printf("%s", response.data);
+    if (response.data[strlen(response.data) - 1] != '\n') {
+        printf("\n");
     }
-    
-    fprintf(temp_file, "#!/bin/bash\n%s", file_content);
-    fclose(temp_file);
-    
-    // Make it executable and run it
-    system("chmod +x /tmp/nfs_exec_script.sh");
-    int result = system("/tmp/nfs_exec_script.sh");
-    
-    // Cleanup
-    unlink("/tmp/nfs_exec_script.sh");
-    free(file_content);
-    
-    printf("\n--- Execution Complete ---\n");
-    
-    return (result == 0) ? 0 : -1;
-    
-    // Create temporary script file
-    FILE *script_file = fopen("/tmp/nfs_exec_script.sh", "w");
-    if (!script_file) {
-        fprintf(stderr, "Error: Failed to create temporary script file\n");
-        return -1;
-    }
-    
-    fprintf(script_file, "#!/bin/bash\n%s\n", response.data);
-    fclose(script_file);
-    
-    // Make executable
-    system("chmod +x /tmp/nfs_exec_script.sh");
-    
-    // Execute and capture output
-    FILE *output = popen("/tmp/nfs_exec_script.sh 2>&1", "r");
-    if (!output) {
-        fprintf(stderr, "Error: Failed to execute script\n");
-        system("rm -f /tmp/nfs_exec_script.sh");
-        return -1;
-    }
-    
-    char line[256];
-    while (fgets(line, sizeof(line), output)) {
-        printf("%s", line);
-    }
-    
-    pclose(output);
-    system("rm -f /tmp/nfs_exec_script.sh");
-    
-    printf("\n--- Execution Complete ---\n");
+    printf("--- Execution Complete ---\n");
     
     return 0;
 }

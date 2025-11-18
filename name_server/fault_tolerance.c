@@ -170,7 +170,7 @@ int handle_ss_reconnection(int ss_id) {
 // ============================================================================
 
 int start_ss_recovery_sync(int recovering_ss_id, int partner_ss_id) {
-    printf("[Fault Tolerance] Starting recovery sync: SS%d <- SS%d\n", 
+    printf("[Fault Tolerance] Starting recovery sync: SS%d <- SS%d (PULL model)\n", 
            recovering_ss_id, partner_ss_id);
     
     // Check if partner is available
@@ -190,7 +190,45 @@ int start_ss_recovery_sync(int recovering_ss_id, int partner_ss_id) {
     }
     pthread_mutex_unlock(&partner_ss->ss_mutex);
     
-    // Initialize recovery session
+    // Check if recovering SS is available to receive the command
+    int recovering_index = find_storage_server(recovering_ss_id);
+    if (recovering_index < 0) {
+        fprintf(stderr, "[Fault Tolerance] Recovering SS%d not found\n", recovering_ss_id);
+        return -1;
+    }
+    
+    StorageServerInfo *recovering_ss = &nm_state->storage_servers[recovering_index];
+    
+    // CRITICAL FIX: Use PULL model (same as registration path)
+    // Send OP_RECOVERY_SYNC to the recovering SS, instructing it to PULL from partner
+    // This avoids the connection problem where partner doesn't have active socket to recovering node
+    
+    int recovering_socket = connect_to_server(recovering_ss->ip, recovering_ss->nm_port);
+    if (recovering_socket < 0) {
+        fprintf(stderr, "[Fault Tolerance] Cannot connect to recovering SS%d\n", recovering_ss_id);
+        return -1;
+    }
+    
+    // Send recovery sync command to recovering SS
+    Message recovery_cmd = {0};
+    recovery_cmd.msg_type = MSG_REQUEST;
+    recovery_cmd.operation = OP_RECOVERY_SYNC;
+    recovery_cmd.ss_id = partner_ss_id;  // Partner SS ID to sync from
+    strncpy(recovery_cmd.backup_ip, partner_ss->ip, MAX_IP_LEN - 1);
+    recovery_cmd.backup_port = partner_ss->client_port;  // Use client_port for replication
+    
+    if (send_message(recovering_socket, &recovery_cmd) < 0) {
+        fprintf(stderr, "[Fault Tolerance] Failed to send recovery command to SS%d\n", recovering_ss_id);
+        close(recovering_socket);
+        return -1;
+    }
+    
+    close(recovering_socket);
+    
+    printf("[Fault Tolerance] Sent OP_RECOVERY_SYNC to SS%d: PULL from SS%d at %s:%d\n",
+           recovering_ss_id, partner_ss_id, partner_ss->ip, partner_ss->client_port);
+    
+    // Initialize recovery session for tracking
     pthread_mutex_lock(&nm_state->recovery_mutex);
     
     SSRecoveryInfo *recovery = NULL;
@@ -221,34 +259,17 @@ int start_ss_recovery_sync(int recovering_ss_id, int partner_ss_id) {
         return -1;
     }
     
-    // Start synchronization process
-    if (sync_metadata_between_ss(partner_ss_id, recovering_ss_id) < 0) {
-        fprintf(stderr, "[Fault Tolerance] Metadata sync failed\n");
-        return -1;
-    }
+    // CRITICAL FIX: Removed PUSH model synchronization
+    // The recovering SS will now PULL data from partner using OP_RECOVERY_SYNC
+    // No need for Name Server to orchestrate metadata/file sync with PUSH operations
+    // The Storage Server handles the entire sync process internally
     
-    if (sync_files_between_ss(partner_ss_id, recovering_ss_id) < 0) {
-        fprintf(stderr, "[Fault Tolerance] File sync failed\n");
-        return -1;
-    }
+    printf("[Fault Tolerance] Recovery sync command sent, SS%d will PULL from SS%d\n",
+           recovering_ss_id, partner_ss_id);
     
-    // Mark synchronization as complete
-    pthread_mutex_lock(&nm_state->recovery_mutex);
-    recovery->sync_complete = 1;
-    recovery->sync_progress = 100;
-    pthread_mutex_unlock(&nm_state->recovery_mutex);
+    // Note: Status update to SS_STATUS_ONLINE happens when SS sends completion notification
+    // via OP_RECOVERY_SYNC response message
     
-    // Update storage server status
-    int recovering_index = find_storage_server(recovering_ss_id);
-    if (recovering_index >= 0) {
-        StorageServerInfo *recovering_ss = &nm_state->storage_servers[recovering_index];
-        
-        pthread_mutex_lock(&recovering_ss->ss_mutex);
-        recovering_ss->status = SS_STATUS_ONLINE;
-        pthread_mutex_unlock(&recovering_ss->ss_mutex);
-    }
-    
-    printf("[Fault Tolerance] Recovery sync completed successfully\n");
     return 0;
 }
 

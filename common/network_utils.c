@@ -81,10 +81,11 @@ int connect_to_server(const char *ip, int port) {
         return -1;
     }
     
-    // CRITICAL FIX: Set timeout to prevent hanging when server is unresponsive
-    // 5-second timeout for both send and receive operations
+    // CRITICAL FIX: Set generous timeout to handle slow operations
+    // 60-second timeout for both send and receive operations
+    // This allows large file transfers and slow user input during WRITE operations
     struct timeval timeout;
-    timeout.tv_sec = 5;
+    timeout.tv_sec = 60;  // Increased from 5 to 60 seconds
     timeout.tv_usec = 0;
     
     if (setsockopt(sockfd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0) {
@@ -118,6 +119,37 @@ int connect_to_server(const char *ip, int port) {
     return sockfd;
 }
 
+// CRITICAL FIX: Endianness conversion for cross-architecture support
+// Convert Message integer fields to network byte order (Big Endian) before sending
+void message_to_network_order(Message *msg) {
+    if (msg == NULL) return;
+    
+    msg->msg_type = htonl(msg->msg_type);
+    msg->operation = htonl(msg->operation);
+    msg->error_code = htonl(msg->error_code);
+    msg->sentence_index = htonl(msg->sentence_index);
+    msg->word_index = htonl(msg->word_index);
+    msg->port1 = htonl(msg->port1);
+    msg->port2 = htonl(msg->port2);
+    msg->ss_id = htonl(msg->ss_id);
+    msg->backup_port = htonl(msg->backup_port);
+}
+
+// Convert Message integer fields to host byte order (native) after receiving
+void message_to_host_order(Message *msg) {
+    if (msg == NULL) return;
+    
+    msg->msg_type = ntohl(msg->msg_type);
+    msg->operation = ntohl(msg->operation);
+    msg->error_code = ntohl(msg->error_code);
+    msg->sentence_index = ntohl(msg->sentence_index);
+    msg->word_index = ntohl(msg->word_index);
+    msg->port1 = ntohl(msg->port1);
+    msg->port2 = ntohl(msg->port2);
+    msg->ss_id = ntohl(msg->ss_id);
+    msg->backup_port = ntohl(msg->backup_port);
+}
+
 // Send a Message structure over socket
 int send_message(int sockfd, Message *msg) {
     if (msg == NULL) {
@@ -125,9 +157,15 @@ int send_message(int sockfd, Message *msg) {
         return -1;
     }
     
+    // CRITICAL FIX: Create a copy and convert to network byte order
+    // This prevents modifying the caller's message structure
+    Message network_msg;
+    memcpy(&network_msg, msg, sizeof(Message));
+    message_to_network_order(&network_msg);
+    
     int total_sent = 0;
     int bytes_to_send = sizeof(Message);
-    char *msg_ptr = (char*)msg;
+    char *msg_ptr = (char*)&network_msg;
     
     while (total_sent < bytes_to_send) {
         int sent = send(sockfd, msg_ptr + total_sent, bytes_to_send - total_sent, 0);
@@ -163,9 +201,15 @@ int receive_message(int sockfd, Message *msg) {
     while (total_received < bytes_to_receive) {
         int received = recv(sockfd, msg_ptr + total_received, bytes_to_receive - total_received, 0);
         if (received < 0) {
-            // CRITICAL FIX: Retry on EINTR (interrupted system call)
+            // CRITICAL FIX: Handle different error types appropriately
             if (errno == EINTR) {
-                continue;  // Retry the recv
+                continue;  // Retry on interrupted system call
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                // Timeout occurred - this is rare with 60s timeout
+                // Could indicate network congestion or very slow operation
+                fprintf(stderr, "Warning: Receive timeout (60s) - connection may be slow\n");
+                continue;  // Retry once more
             }
             print_error("Error receiving message");
             return -1;
@@ -176,6 +220,9 @@ int receive_message(int sockfd, Message *msg) {
         }
         total_received += received;
     }
+    
+    // CRITICAL FIX: Convert from network byte order to host byte order
+    message_to_host_order(msg);
     
     return total_received;
 }

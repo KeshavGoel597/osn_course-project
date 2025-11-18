@@ -444,6 +444,11 @@ LoadedFile* load_file_into_memory(const char *filename) {
     pthread_rwlock_init(&loaded->file_rwlock, NULL);
     loaded->next = NULL;
     
+    // CRITICAL FIX: Initialize reference counting
+    loaded->refcount = 0;
+    pthread_mutex_init(&loaded->refcount_lock, NULL);
+    loaded->marked_for_deletion = 0;
+    
     // Count sentences
     loaded->sentence_count = 0;
     SentenceNode *s = sentences;
@@ -457,6 +462,57 @@ LoadedFile* load_file_into_memory(const char *filename) {
     return loaded;
 }
 
+// CRITICAL FIX: Reference counting functions to prevent memory leak on delete
+void file_addref(LoadedFile *file) {
+    if (!file) return;
+    pthread_mutex_lock(&file->refcount_lock);
+    file->refcount++;
+    pthread_mutex_unlock(&file->refcount_lock);
+}
+
+void file_release(LoadedFile *file) {
+    if (!file) return;
+    
+    pthread_mutex_lock(&file->refcount_lock);
+    file->refcount--;
+    int refs = file->refcount;
+    int marked = file->marked_for_deletion;
+    pthread_mutex_unlock(&file->refcount_lock);
+    
+    // If refcount reaches 0 AND file is marked for deletion, free it
+    if (refs == 0 && marked) {
+        printf("[RefCount] File '%s' refcount=0 and marked for deletion, freeing memory\n", 
+               file->filename);
+        
+        // Remove from cache
+        pthread_mutex_lock(&file_cache_mutex);
+        LoadedFile *current = file_cache_head;
+        LoadedFile *prev = NULL;
+        
+        while (current != NULL) {
+            if (current == file) {
+                if (prev == NULL) {
+                    file_cache_head = current->next;
+                } else {
+                    prev->next = current->next;
+                }
+                break;
+            }
+            prev = current;
+            current = current->next;
+        }
+        pthread_mutex_unlock(&file_cache_mutex);
+        
+        // Free memory
+        if (file->sentences_head) {
+            free_sentence_list(file->sentences_head);
+        }
+        pthread_rwlock_destroy(&file->file_rwlock);
+        pthread_mutex_destroy(&file->refcount_lock);
+        free(file);
+    }
+}
+
 // Get file from cache (with lazy loading)
 LoadedFile* get_file_from_cache(const char *filename) {
     pthread_mutex_lock(&file_cache_mutex);
@@ -465,6 +521,8 @@ LoadedFile* get_file_from_cache(const char *filename) {
     LoadedFile *current = file_cache_head;
     while (current != NULL) {
         if (strcmp(current->filename, filename) == 0 && current->is_loaded) {
+            // CRITICAL FIX: Increment reference count when returning cached file
+            file_addref(current);
             pthread_mutex_unlock(&file_cache_mutex);
             return current;
         }
@@ -482,6 +540,9 @@ LoadedFile* get_file_from_cache(const char *filename) {
     // Add to cache (at head) - still holding mutex
     loaded->next = file_cache_head;
     file_cache_head = loaded;
+    
+    // CRITICAL FIX: Increment reference count for newly loaded file
+    file_addref(loaded);
     
     pthread_mutex_unlock(&file_cache_mutex);
     return loaded;
@@ -624,16 +685,61 @@ int delete_file_ll(const char *filename) {
         return ERR_FILE_NOT_FOUND;
     }
     
-    // CRITICAL FIX: Do NOT forcibly unload from memory!
-    // If file is in use (someone has a pointer to it), forcibly freeing
-    // will cause use-after-free bugs and segfaults.
-    // Instead: Mark as deleted and let it be removed when no longer in use.
-    // For now, we simply don't unload - file will stay in memory but
-    // won't be accessible via disk operations.
-    // The memory will be reclaimed when server restarts or cache is cleared.
+    // CRITICAL FIX: Use reference counting to safely delete files
+    // Mark file for deletion and only free memory when refcount reaches 0
+    pthread_mutex_lock(&file_cache_mutex);
+    LoadedFile *current = file_cache_head;
+    while (current != NULL) {
+        if (strcmp(current->filename, filename) == 0) {
+            pthread_mutex_lock(&current->refcount_lock);
+            current->marked_for_deletion = 1;
+            int refs = current->refcount;
+            pthread_mutex_unlock(&current->refcount_lock);
+            
+            printf("[Delete] File '%s' marked for deletion (refcount=%d)\n", filename, refs);
+            
+            // If refcount is 0, we can free immediately
+            if (refs == 0) {
+                // Remove from cache list
+                LoadedFile *prev = NULL;
+                LoadedFile *temp = file_cache_head;
+                while (temp != NULL) {
+                    if (temp == current) {
+                        if (prev == NULL) {
+                            file_cache_head = temp->next;
+                        } else {
+                            prev->next = temp->next;
+                        }
+                        break;
+                    }
+                    prev = temp;
+                    temp = temp->next;
+                }
+                
+                pthread_mutex_unlock(&file_cache_mutex);
+                
+                // Free memory
+                if (current->sentences_head) {
+                    free_sentence_list(current->sentences_head);
+                }
+                pthread_rwlock_destroy(&current->file_rwlock);
+                pthread_mutex_destroy(&current->refcount_lock);
+                free(current);
+                
+                printf("[Delete] File '%s' freed from memory immediately (refcount was 0)\n", filename);
+            } else {
+                pthread_mutex_unlock(&file_cache_mutex);
+                printf("[Delete] File '%s' will be freed when refcount reaches 0\n", filename);
+            }
+            
+            break;
+        }
+        current = current->next;
+    }
     
-    // NOTE: In production, implement reference counting to properly handle this.
-    // For this project, the above approach is safer than use-after-free.
+    if (current == NULL) {
+        pthread_mutex_unlock(&file_cache_mutex);
+    }
     
     // Delete the file from disk
     char filepath[MAX_PATH];
@@ -660,7 +766,7 @@ int delete_file_ll(const char *filename) {
     
     save_metadata_ll();
     
-    printf("File '%s' deleted from disk (memory cache not cleared for safety)\n", filename);
+    printf("File '%s' deleted from disk\n", filename);
     return 0;
 }
 
@@ -674,6 +780,7 @@ int read_file_ll(const char *filename, char *content, int max_size) {
     // If any sentence is locked (write in progress), read from disk instead
     if (file_has_locked_sentences(filename)) {
         printf("[READ] File has locked sentences, reading from disk for isolation\n");
+        file_release(file);  // CRITICAL FIX: Release reference before returning
         return read_file_from_disk_ll(filename, content, max_size);
     }
     
@@ -722,6 +829,7 @@ int read_file_ll(const char *filename, char *content, int max_size) {
         pthread_mutex_unlock(&metadata_mutex);
     }
     
+    file_release(file);  // CRITICAL FIX: Release reference before returning
     return 0;
 }
 
@@ -1121,6 +1229,67 @@ int update_file_modified_time_ll(const char *filename) {
     get_timestamp(meta->modified_time, sizeof(meta->modified_time));
     pthread_mutex_unlock(&metadata_mutex);
     save_metadata_ll();
+    return 0;
+}
+
+// CRITICAL FIX: Consolidated metadata update to prevent race conditions
+// Updates modified time, file size, and word count in a SINGLE atomic operation
+// Prevents lost updates from multiple sequential locks
+int update_file_write_stats_ll(const char *filename) {
+    FileMetadata *meta = find_metadata(filename);
+    if (meta == NULL) return ERR_FILE_NOT_FOUND;
+    
+    // Get file statistics from disk
+    char filepath[MAX_PATH];
+    get_file_path(filename, filepath, MAX_PATH);
+    
+    struct stat file_stat;
+    if (stat(filepath, &file_stat) != 0) {
+        return -1;
+    }
+    
+    // Count words by reading file
+    FILE *fp = fopen(filepath, "r");
+    if (!fp) {
+        return -1;
+    }
+    
+    int word_count = 0;
+    int char_count = 0;
+    int in_word = 0;
+    int ch;
+    
+    while ((ch = fgetc(fp)) != EOF) {
+        char_count++;
+        if (ch == ' ' || ch == '\n' || ch == '\t') {
+            if (in_word) {
+                word_count++;
+                in_word = 0;
+            }
+        } else {
+            in_word = 1;
+        }
+    }
+    if (in_word) word_count++;
+    fclose(fp);
+    
+    // CRITICAL: Single mutex lock for all updates - prevents race conditions
+    pthread_mutex_lock(&metadata_mutex);
+    
+    // Update all statistics atomically
+    get_timestamp(meta->modified_time, sizeof(meta->modified_time));
+    meta->file_size = file_stat.st_size;
+    meta->word_count = word_count;
+    meta->char_count = char_count;
+    
+    pthread_mutex_unlock(&metadata_mutex);
+    
+    // Single disk write for all changes
+    save_metadata_ll();
+    
+    printf("[Metadata] Updated write stats for '%s': size=%ld, words=%d, chars=%d\n",
+           filename, meta->file_size, meta->word_count, meta->char_count);
+    
     return 0;
 }
 

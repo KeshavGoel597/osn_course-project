@@ -78,7 +78,7 @@ int init_name_server() {
     nm_state->ss_count = 0;
     nm_state->client_count = 0;
     nm_state->request_count = 0;
-    nm_state->next_primary_ss = 1;  // Start with SS1
+    nm_state->next_primary_ss = 0;  // CRITICAL FIX: Start with index 0, not SS ID 1
     nm_state->running = 1;
     
     // Initialize hash table for efficient file search (O(1))

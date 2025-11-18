@@ -7,6 +7,7 @@
 // Client configuration
 typedef struct {
     char username[MAX_USERNAME];
+    char nm_ip[MAX_IP_LEN];      // Name Server IP address
     char client_ip[MAX_IP_LEN];
     int nm_port;           // Port for Name Server connection
     int ss_port;           // Port for Storage Server connection

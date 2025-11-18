@@ -8,8 +8,9 @@
 #define MAX_IP_LEN 16
 #define MAX_PATH 1024       // Increased from 512 to avoid truncation warnings
 
-// Name Server connection details (hardcoded as per requirements)
-#define NM_IP "127.0.0.1"
+// Name Server connection details
+// CRITICAL FIX: NM_IP removed - now passed as command-line argument for multi-machine deployment
+// Default port (can be overridden in Name Server launch)
 #define NM_PORT 8080
 
 // Message Types

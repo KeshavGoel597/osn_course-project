@@ -12,13 +12,13 @@
 // Register storage server with Name Server
 int register_with_nm(int nm_port, int client_port, const char *ss_ip) {
     // Connect to Name Server
-    int nm_sockfd = connect_to_server(NM_IP, NM_PORT);
+    int nm_sockfd = connect_to_server(server_config.nm_ip, NM_PORT);
     if (nm_sockfd < 0) {
-        fprintf(stderr, "Failed to connect to Name Server at %s:%d\n", NM_IP, NM_PORT);
+        fprintf(stderr, "Failed to connect to Name Server at %s:%d\n", server_config.nm_ip, NM_PORT);
         return -1;
     }
     
-    printf("Connected to Name Server at %s:%d\n", NM_IP, NM_PORT);
+    printf("Connected to Name Server at %s:%d\n", server_config.nm_ip, NM_PORT);
     
     // Prepare registration message
     Message reg_msg;
@@ -357,7 +357,7 @@ void* handle_nm_connection(void *arg) {
                 strcpy(response.data, "Recovery sync completed");
                 
                 // Notify Name Server that recovery is complete
-                int nm_sockfd = connect_to_server(NM_IP, NM_PORT);
+                int nm_sockfd = connect_to_server(server_config.nm_ip, NM_PORT);
                 if (nm_sockfd >= 0) {
                     Message notify;
                     memset(&notify, 0, sizeof(Message));

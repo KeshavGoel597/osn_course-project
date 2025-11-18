@@ -484,33 +484,38 @@ void setup_backup_pairing(int primary_ss_id) {
 int get_available_primary_server() {
     pthread_mutex_lock(&nm_state->assignment_mutex);
     
-    // Round-robin assignment among primary servers
-    int start_ss = nm_state->next_primary_ss;
+    // CRITICAL FIX: Iterate through actual registered servers, not guessed IDs
+    // This handles sparse IDs, large IDs, and is much more efficient
+    
+    if (nm_state->ss_count == 0) {
+        pthread_mutex_unlock(&nm_state->assignment_mutex);
+        printf("[Load Balancing] Error: No storage servers registered\n");
+        return -1;
+    }
+    
+    // Round-robin assignment starting from last assigned index
+    int start_index = nm_state->next_primary_ss;
     int selected_ss = -1;
     
-    for (int attempts = 0; attempts < MAX_STORAGE_SERVERS; attempts++) {
-        int current_ss = start_ss + (attempts * 2);  // Only check odd numbers (primaries)
+    // Try each registered server, starting from next_primary_ss index
+    for (int i = 0; i < nm_state->ss_count; i++) {
+        int current_index = (start_index + i) % nm_state->ss_count;
+        StorageServerInfo *ss = &nm_state->storage_servers[current_index];
         
-        if (current_ss > MAX_STORAGE_SERVERS) {
-            current_ss = 1 + (attempts % 2) * 2;  // Wrap around to 1, 3, 5...
-        }
+        pthread_mutex_lock(&ss->ss_mutex);
         
-        int ss_index = find_storage_server(current_ss);
-        if (ss_index >= 0) {
-            StorageServerInfo *ss = &nm_state->storage_servers[ss_index];
+        // Check if this server is online and is a primary server
+        if (ss->status == SS_STATUS_ONLINE && ss->is_primary) {
+            selected_ss = ss->ss_id;
             
-            pthread_mutex_lock(&ss->ss_mutex);
-            if (ss->status == SS_STATUS_ONLINE && ss->is_primary) {
-                selected_ss = current_ss;
-                nm_state->next_primary_ss = current_ss + 2;  // Next primary
-                if (nm_state->next_primary_ss > MAX_STORAGE_SERVERS) {
-                    nm_state->next_primary_ss = 1;
-                }
-                pthread_mutex_unlock(&ss->ss_mutex);
-                break;
-            }
+            // Update next_primary_ss to the next index for true round-robin
+            nm_state->next_primary_ss = (current_index + 1) % nm_state->ss_count;
+            
             pthread_mutex_unlock(&ss->ss_mutex);
+            break;
         }
+        
+        pthread_mutex_unlock(&ss->ss_mutex);
     }
     
     pthread_mutex_unlock(&nm_state->assignment_mutex);

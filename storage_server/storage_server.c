@@ -7,6 +7,8 @@
 #include <signal.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <ifaddrs.h>
+#include <netdb.h>
 
 // Global server configuration
 SSConfig server_config;
@@ -17,14 +19,63 @@ ReplicationQueue replication_queue;
 // Global flag to control server running state
 volatile sig_atomic_t server_running = 1;
 
+// CRITICAL FIX: Get actual non-loopback IP address
+int get_local_ip(char *ip_buffer, size_t buffer_size) {
+    struct ifaddrs *ifaddr, *ifa;
+    int family;
+    char host[NI_MAXHOST];
+    
+    if (getifaddrs(&ifaddr) == -1) {
+        perror("getifaddrs");
+        // Fallback to localhost
+        strncpy(ip_buffer, "127.0.0.1", buffer_size - 1);
+        return -1;
+    }
+    
+    // Iterate through interfaces to find first non-loopback IPv4 address
+    for (ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL) continue;
+        
+        family = ifa->ifa_addr->sa_family;
+        
+        // We want IPv4 addresses only
+        if (family == AF_INET) {
+            int s = getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in),
+                               host, NI_MAXHOST, NULL, 0, NI_NUMERICHOST);
+            if (s != 0) {
+                continue;
+            }
+            
+            // Skip loopback
+            if (strncmp(host, "127.", 4) != 0) {
+                strncpy(ip_buffer, host, buffer_size - 1);
+                ip_buffer[buffer_size - 1] = '\0';
+                freeifaddrs(ifaddr);
+                printf("[IP Detection] Found non-loopback IP: %s (%s)\n", host, ifa->ifa_name);
+                return 0;
+            }
+        }
+    }
+    
+    freeifaddrs(ifaddr);
+    
+    // No non-loopback address found, use localhost
+    printf("[IP Detection] No non-loopback IP found, using localhost\n");
+    strncpy(ip_buffer, "127.0.0.1", buffer_size - 1);
+    return 0;
+}
+
 // Initialize storage server
 int init_storage_server(int nm_port, int client_port, const char *storage_dir) {
     server_config.nm_port = nm_port;
     server_config.client_port = client_port;
     strncpy(server_config.storage_dir, storage_dir, MAX_PATH - 1);
     
-    // Get local IP address (simplified - using localhost for now)
-    strncpy(server_config.ss_ip, "127.0.0.1", MAX_IP_LEN - 1);
+    // CRITICAL FIX: Get actual network IP address instead of hardcoding 127.0.0.1
+    // This allows the server to work on different machines/containers
+    if (get_local_ip(server_config.ss_ip, MAX_IP_LEN) < 0) {
+        fprintf(stderr, "Warning: Could not detect IP address, using 127.0.0.1\n");
+    }
     
     printf("=== Storage Server Initialization ===\n");
     printf("NM Port: %d\n", nm_port);
@@ -248,24 +299,37 @@ void signal_handler(int signum) {
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 5) {
-        fprintf(stderr, "Usage: %s <ss_id> <nm_port> <client_port> <storage_dir>\n", argv[0]);
-        fprintf(stderr, "Example: %s 1 9001 9002 ./storage_data1\n", argv[0]);
+    if (argc != 6) {
+        fprintf(stderr, "Usage: %s <ss_id> <nm_ip> <nm_port> <client_port> <storage_dir>\n", argv[0]);
+        fprintf(stderr, "Example: %s 1 127.0.0.1 9001 9002 ./storage_data1\n", argv[0]);
+        fprintf(stderr, "         %s 1 192.168.1.100 9001 9002 ./storage_data1  # For remote NM\n", argv[0]);
         fprintf(stderr, "         SS_ID: 1=primary, 2=backup for SS1, 3=primary, 4=backup for SS3, ...\n");
+        fprintf(stderr, "         NM_IP: IP address of Name Server (use 127.0.0.1 for localhost)\n");
         return 1;
     }
     
-    // CRITICAL FIX: Validate command line arguments
+    // CRITICAL FIX: Accept Name Server IP as command-line argument
     int ss_id = atoi(argv[1]);
-    int nm_port = atoi(argv[2]);
-    int client_port = atoi(argv[3]);
-    const char *storage_dir = argv[4];
+    const char *nm_ip = argv[2];
+    int nm_port = atoi(argv[3]);
+    int client_port = atoi(argv[4]);
+    const char *storage_dir = argv[5];
     
     // Validate ss_id
     if (ss_id <= 0 || ss_id > 100) {
         fprintf(stderr, "Error: SS_ID must be between 1 and 100\n");
         return 1;
     }
+    
+    // Validate NM IP address (basic check)
+    if (strlen(nm_ip) == 0 || strlen(nm_ip) >= MAX_IP_LEN) {
+        fprintf(stderr, "Error: Invalid Name Server IP address\n");
+        return 1;
+    }
+    
+    // Store NM IP in server config
+    strncpy(server_config.nm_ip, nm_ip, MAX_IP_LEN - 1);
+    server_config.nm_ip[MAX_IP_LEN - 1] = '\0';
     
     // Validate ports
     if (nm_port <= 1024 || nm_port > 65535) {

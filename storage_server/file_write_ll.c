@@ -170,7 +170,17 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     if (sentence_index < 0 || sentence_index > file->sentence_count) {
         printf("[DEBUG] Sentence index out of range: %d > %d\n", sentence_index, file->sentence_count);
         pthread_rwlock_unlock(&file->file_rwlock);
+        file_release(file);  // CRITICAL FIX: Release reference
         return ERR_SENTENCE_OUT_OF_RANGE;
+    }
+    
+    // CRITICAL FIX: For new sentences, word_index must be 0 (can't write to middle of non-existent sentence)
+    // Check this BEFORE creating the sentence to avoid leaving empty sentences on error
+    if (target_sent == NULL && word_index != 0) {
+        fprintf(stderr, "[DEBUG] Cannot write at word_index %d in new sentence (must be 0)\n", word_index);
+        pthread_rwlock_unlock(&file->file_rwlock);
+        file_release(file);
+        return ERR_WORD_OUT_OF_RANGE;
     }
     
     // If appending new sentence
@@ -180,6 +190,7 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
         if (target_sent == NULL) {
             fprintf(stderr, "[Write LL] Failed to allocate new sentence node\n");
             pthread_rwlock_unlock(&file->file_rwlock);
+            file_release(file);  // CRITICAL FIX: Release reference
             return -1;
         }
         if (prev_sent != NULL) {
@@ -193,9 +204,10 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     // Count words in target sentence
     int word_count = count_words_in_sentence(target_sent);
     
-    // Check if word index is valid
+    // Check if word index is valid (for existing sentences)
     if (word_index < 0 || word_index > word_count) {
         pthread_rwlock_unlock(&file->file_rwlock);
+        file_release(file);  // CRITICAL FIX: Release reference
         return ERR_WORD_OUT_OF_RANGE;
     }
     
@@ -205,6 +217,7 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     
     if (group_count == 0) {
         pthread_rwlock_unlock(&file->file_rwlock);
+        file_release(file);  // CRITICAL FIX: Release reference
         return 0;  // Nothing to insert
     }
     
@@ -218,7 +231,13 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     for (int i = 0; i < groups[0].word_count; i++) {
         WordNode *new_word = create_word_node(groups[0].words[i]);
         if (new_word == NULL) {
+            // CRITICAL: malloc failed - linked list is now partially modified!
+            // Caller (handle_write_request) will rollback from undo backup
+            fprintf(stderr, "[Write LL] CRITICAL: malloc failed for word node (word %d/%d)\n", 
+                    i, groups[0].word_count);
+            fprintf(stderr, "[Write LL] Linked list partially modified - requires rollback\n");
             pthread_rwlock_unlock(&file->file_rwlock);
+            file_release(file);  // CRITICAL FIX: Release reference
             return -1;
         }
         
@@ -255,7 +274,11 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
         for (int g = 1; g < group_count; g++) {
             SentenceNode *new_sent = create_sentence_node(groups[g].delimiter);
             if (new_sent == NULL) {
+                fprintf(stderr, "[Write LL] CRITICAL: malloc failed for sentence node (sentence %d/%d)\n", 
+                        g, group_count);
+                fprintf(stderr, "[Write LL] Linked list partially modified - requires rollback\n");
                 pthread_rwlock_unlock(&file->file_rwlock);
+                file_release(file);  // CRITICAL FIX: Release reference
                 return -1;
             }
             
@@ -264,7 +287,10 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
             for (int w = 0; w < groups[g].word_count; w++) {
                 WordNode *new_word = create_word_node(groups[g].words[w]);
                 if (new_word == NULL) {
+                    fprintf(stderr, "[Write LL] CRITICAL: malloc failed for word node in new sentence\n");
+                    fprintf(stderr, "[Write LL] Linked list partially modified - requires rollback\n");
                     pthread_rwlock_unlock(&file->file_rwlock);
+                    file_release(file);  // CRITICAL FIX: Release reference
                     return -1;
                 }
                 
@@ -302,6 +328,7 @@ int write_to_file_ll(const char *filename, int sentence_index, int word_index,
     }
     
     pthread_rwlock_unlock(&file->file_rwlock);
+    file_release(file);  // CRITICAL FIX: Release reference
     
     // NOTE: Do NOT sync to disk here - sync happens only after ETIRW
     // This ensures atomicity: other clients don't see partial writes

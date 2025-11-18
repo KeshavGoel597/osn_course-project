@@ -324,20 +324,33 @@ int handle_write_request(int client_sockfd, Message *msg) {
         write_response.msg_type = MSG_ACK;
         write_response.operation = OP_WRITE;
         
-        if (result < 0) {
+        // CRITICAL FIX: Error codes are POSITIVE values (ERR_WORD_OUT_OF_RANGE = 1010)
+        // Check for specific error codes OR negative result (malloc failure)
+        if (result == ERR_SENTENCE_OUT_OF_RANGE || result == ERR_WORD_OUT_OF_RANGE) {
             write_response.msg_type = MSG_ERROR;
-            if (result == ERR_SENTENCE_OUT_OF_RANGE) {
-                write_response.error_code = ERR_SENTENCE_OUT_OF_RANGE;
-            } else if (result == ERR_WORD_OUT_OF_RANGE) {
-                write_response.error_code = ERR_WORD_OUT_OF_RANGE;
-            } else {
-                write_response.error_code = ERR_SERVER_ERROR;
-            }
+            write_response.error_code = result;
+        } else if (result < 0) {
+            // CRITICAL FIX: Server error (likely malloc failure)
+            // Linked list may be in partially modified state - abort and rollback
+            write_response.msg_type = MSG_ERROR;
+            write_response.error_code = ERR_SERVER_ERROR;
+            strcpy(write_response.data, "Write failed - operation aborted");
+            send_message(client_sockfd, &write_response);
+            
+            printf("[WRITE] Critical error in write_to_file_ll (possibly malloc failure)\n");
+            printf("[WRITE] Aborting write session and rolling back changes\n");
+            
+            // Break out of loop to trigger rollback
+            write_completed = 0;
+            break;
         } else {
             write_response.error_code = ERR_SUCCESS;
         }
         
-        send_message(client_sockfd, &write_response);
+        // Send response (unless we broke above for critical error)
+        if (write_completed != 0 || result >= 0 || result == ERR_SENTENCE_OUT_OF_RANGE || result == ERR_WORD_OUT_OF_RANGE) {
+            send_message(client_sockfd, &write_response);
+        }
     }
     
     // Always unlock the sentence, even if write didn't complete
@@ -363,11 +376,9 @@ int handle_write_request(int client_sockfd, Message *msg) {
     printf("[WRITE] ETIRW received - syncing changes to disk\n");
     sync_file_to_disk(msg->filename);
     
-    // Update file modified timestamp
-    update_file_modified_time_ll(msg->filename);
-    
-    // Update file statistics (word count, character count, file size)
-    update_file_statistics_ll(msg->filename);
+    // CRITICAL FIX: Use consolidated metadata update to prevent race conditions
+    // Updates modified_time, file_size, word_count, char_count atomically
+    update_file_write_stats_ll(msg->filename);
     
     // Replicate changes to backup server asynchronously (non-blocking)
     if (server_config.is_primary) {

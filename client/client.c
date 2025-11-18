@@ -15,8 +15,11 @@ int init_client(const char *username) {
     
     strncpy(client_config.username, username, MAX_USERNAME - 1);
     strncpy(client_config.client_ip, "127.0.0.1", MAX_IP_LEN - 1);
-    client_config.nm_port = 7001;   // Example port for NM connection
-    client_config.ss_port = 7002;   // Example port for SS connection
+    
+    // CRITICAL FIX: Client doesn't listen on any ports (only makes outgoing connections)
+    // Set to 0 to indicate "not listening" rather than misleading hardcoded values
+    client_config.nm_port = 0;   // Not used - client initiates connections
+    client_config.ss_port = 0;   // Not used - client initiates connections
     
     printf("\n=== Client Initialization ===\n");
     printf("Username: %s\n", client_config.username);
@@ -27,14 +30,14 @@ int init_client(const char *username) {
 
 // Register with Name Server
 int register_with_nm() {
-    int sockfd = connect_to_server(NM_IP, NM_PORT);
+    int sockfd = connect_to_server(client_config.nm_ip, NM_PORT);
     if (sockfd < 0) {
-        fprintf(stderr, "Failed to connect to Name Server at %s:%d\n", NM_IP, NM_PORT);
+        fprintf(stderr, "Failed to connect to Name Server at %s:%d\n", client_config.nm_ip, NM_PORT);
         fprintf(stderr, "Make sure the Name Server is running.\n");
         return -1;
     }
     
-    printf("Connected to Name Server at %s:%d\n", NM_IP, NM_PORT);
+    printf("Connected to Name Server at %s:%d\n", client_config.nm_ip, NM_PORT);
     
     // Prepare registration message
     Message reg_msg;
@@ -217,11 +220,17 @@ void signal_handler(int signum) {
 }
 
 int main(int argc, char *argv[]) {
-    // Prompt for username if not provided
+    // Accept nm_ip and username
+    char nm_ip[MAX_IP_LEN] = "127.0.0.1";  // Default for backward compatibility
     char username[MAX_USERNAME];
     
+    // Usage: ./client [nm_ip] [username]
     if (argc >= 2) {
-        strncpy(username, argv[1], MAX_USERNAME - 1);
+        strncpy(nm_ip, argv[1], MAX_IP_LEN - 1);
+    }
+    
+    if (argc >= 3) {
+        strncpy(username, argv[2], MAX_USERNAME - 1);
     } else {
         printf("Enter username: ");
         fflush(stdout);
@@ -246,6 +255,9 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "Failed to initialize client\n");
         return 1;
     }
+    
+    // CRITICAL FIX: Store nm_ip AFTER init_client() to avoid memset zeroing it out
+    strncpy(client_config.nm_ip, nm_ip, MAX_IP_LEN - 1);
     
     // Register with Name Server
     // CRITICAL FIX: Don't allow offline mode - NM is required for all operations

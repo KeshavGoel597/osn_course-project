@@ -210,7 +210,9 @@ int send_write_request(const char *filename, int sentence_index) {
         int word_index;
         char content[MAX_DATA_SIZE];
         
-        if (sscanf(input, "%d %[^\n]", &word_index, content) != 2) {
+        // CRITICAL FIX: Specify width limit to prevent buffer overflow
+        // MAX_DATA_SIZE is 4096, so use 4095 to leave room for null terminator
+        if (sscanf(input, "%d %4095[^\n]", &word_index, content) != 2) {
             fprintf(stderr, "Invalid format. Use: <word_index> <content>\n");
             continue;
         }

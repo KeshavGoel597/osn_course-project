@@ -36,6 +36,12 @@ typedef struct LoadedFile {
     int sentence_count;
     int is_loaded;                  // Flag: 1 if loaded, 0 if not
     pthread_rwlock_t file_rwlock;   // Reader-writer lock for READ vs WRITE
+    
+    // CRITICAL FIX: Reference counting to prevent memory leak on delete
+    int refcount;                   // Number of active references to this file
+    pthread_mutex_t refcount_lock;  // Protects refcount
+    int marked_for_deletion;        // Flag: file deleted but still in memory due to refs
+    
     struct LoadedFile *next;        // For hash table chaining or linked list
 } LoadedFile;
 
@@ -57,6 +63,11 @@ int init_file_handler_ll(const char *storage_dir);
 LoadedFile* load_file_into_memory(const char *filename);
 int unload_file_from_memory(const char *filename);
 LoadedFile* get_file_from_cache(const char *filename);
+
+// CRITICAL FIX: Reference counting functions to prevent memory leak
+void file_addref(LoadedFile *file);
+void file_release(LoadedFile *file);
+
 int create_file_ll(const char *filename, const char *owner);
 int delete_file_ll(const char *filename);
 int read_file_ll(const char *filename, char *content, int max_size);
@@ -73,6 +84,10 @@ int get_file_metadata_ll(const char *filename, FileMetadata *metadata);
 int update_file_metadata_ll(const char *filename, FileMetadata *metadata);
 int update_file_modified_time_ll(const char *filename);
 int update_file_statistics_ll(const char *filename);
+
+// CRITICAL FIX: Consolidated metadata update (prevents race condition)
+int update_file_write_stats_ll(const char *filename);
+
 int update_file_accessed_time_ll(const char *filename, const char *username);
 int has_read_access_ll(const char *filename, const char *username);
 int has_write_access_ll(const char *filename, const char *username);
@@ -171,6 +186,7 @@ int send_ack_to_nm(int nm_sockfd, int operation, int error_code);
 
 // Global configuration
 typedef struct {
+    char nm_ip[MAX_IP_LEN];      // Name Server IP address
     int nm_port;           // Port for Name Server connections
     int client_port;       // Port for Client connections
     char storage_dir[MAX_PATH];  // Directory to store files
