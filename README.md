@@ -6,8 +6,6 @@
 
 A robust, multi-threaded Network File System (NFS) written in C. This project implements a decoupled architecture separating metadata management from actual data storage, allowing for scalable, concurrent, and secure file operations across multiple distributed storage servers.
 
-> **Note:** All bonus features have been successfully implemented with the exception of fault tolerance.
-
 ## 🌟 Unique Feature
 
 The client features a highly intuitive, interactive `HELP` command interface that maps out all available options and functionalities, significantly improving the developer and user experience.
